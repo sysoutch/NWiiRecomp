@@ -22,6 +22,13 @@ struct DrawRaw {
     uint8_t defPosMtxIdx;
     uint8_t defTexMtxIdx[8];
     bool need_normal;   // lighting enabled at snapshot time
+    // Position/normal matrix captured at parse time for this draw. GX skins by
+    // swapping the matrix in a slot between draws; the renderer applies loads
+    // late, so a live lookup gives the wrong (last-written) matrix. Snapshot
+    // makes the transform use the matrix that was current for THIS draw.
+    bool have_snap_mtx = false;
+    float snap_pos_mtx[12];
+    float snap_nrm_mtx[9];
     uint16_t count;
     std::vector<uint8_t> bytes;
 };

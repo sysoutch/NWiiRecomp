@@ -19,6 +19,29 @@ namespace nwii::runtime::gx {
 
 extern GXState g_state;
 
+// NWII_SKINDBG state (declared early so ParseCP/ParseBP in the anonymous
+// namespace can reference it).
+// Parse-time shadow of the XF matrix memory: matrix loads (direct 0x10 and
+// indexed 0x20-0x38) are applied here as the stream is parsed, so each draw
+// can snapshot the matrix that is current at its point in the stream — before
+// the renderer applies later loads over the same slot.
+static float g_parse_posmtx[256] = {0};
+static float g_parse_nrmmtx[96] = {0};
+
+static void ParseApplyMatrixWrite(uint32_t xf_addr, const std::vector<float>& payload) {
+    for (size_t i = 0; i < payload.size(); ++i) {
+        uint32_t a = xf_addr + (uint32_t)i;
+        if (a < 256) g_parse_posmtx[a] = payload[i];
+        else if (a >= 0x400 && a < 0x400 + 96) g_parse_nrmmtx[a - 0x400] = payload[i];
+    }
+}
+
+static bool g_skindbg = false;
+static uint64_t g_skin_loaded_rows = 0;
+static uint64_t g_skin_used_rows = 0;
+static uint64_t g_skin_used_missing = 0;
+static uint64_t g_skin_draws_total = 0, g_skin_draws_pmidx = 0, g_skin_defnz = 0, g_skin_snapped = 0;
+
 namespace {
     inline bool gx_trace() {
         static bool t = std::getenv("NWII_GXTRACE") != nullptr;
@@ -201,6 +224,15 @@ namespace {
     
     void ParseCP(uint8_t reg, uint32_t val) {
         g_state.cp[reg] = val;
+        if (g_skindbg && (reg == 0x50 || reg == 0x30 || reg == 0x60)) {
+            static uint32_t last50=0xFFFFFFFF, last30=0xFFFFFFFF, last60=0xFFFFFFFF;
+            uint32_t* lp = reg==0x50?&last50:(reg==0x30?&last30:&last60);
+            if (val != *lp) {
+                *lp = val;
+                printf("[CPTR] reg=0x%02X val=0x%08X (0x50.bit0/posMatIdx=%d)\n",
+                       reg, val, reg==0x50 ? (val & 1) : -1);
+            }
+        }
         if (reg >= 0xA0 && reg <= 0xAF) {
             g_state.arrayBase[reg - 0xA0] = val & 0x3FFFFFFF;
         } else if (reg >= 0xB0 && reg <= 0xBF) {
@@ -485,13 +517,7 @@ struct DLCacheEntry {
 };
 static std::unordered_map<uint64_t, DLCacheEntry> s_dl_cache;
 uint64_t g_prof_dl_hits = 0;
-// NWII_SKINDBG: track which XF matrix slots get loaded vs which posMtxIdx the
-// draws reference, to see if skinned geometry (Mario) points at empty slots.
-static bool g_skindbg = false;
-static uint64_t g_skin_loaded_rows = 0; // bitset of loaded matrix rows (xf/4)
-static uint64_t g_skin_used_rows = 0;   // bitset of posMtxIdx used by draws
-static uint64_t g_skin_used_missing = 0;// posMtxIdx used with no matrix loaded
-static uint64_t g_skin_draws_total = 0, g_skin_draws_pmidx = 0, g_skin_defnz = 0;
+// NWII_SKINDBG report (state declared earlier for ParseCP visibility).
 static void skin_report() {
     static auto t0 = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -503,12 +529,13 @@ static void skin_report() {
     for (int i = 0; i < 64; i++) if (g_skin_used_rows & (1ull<<i)) printf(" %d", i);
     printf(" | used-but-unloaded:");
     for (int i = 0; i < 64; i++) if (g_skin_used_missing & (1ull<<i)) printf(" %d", i);
-    printf(" | draws=%llu perVtxIdx=%llu defNonZero=%llu\n",
+    printf(" | draws=%llu perVtxIdx=%llu defNonZero=%llu snapped=%llu\n",
            (unsigned long long)g_skin_draws_total,
            (unsigned long long)g_skin_draws_pmidx,
-           (unsigned long long)g_skin_defnz);
+           (unsigned long long)g_skin_defnz,
+           (unsigned long long)g_skin_snapped);
     g_skin_loaded_rows = g_skin_used_rows = g_skin_used_missing = 0;
-    g_skin_draws_total = g_skin_draws_pmidx = g_skin_defnz = 0;
+    g_skin_draws_total = g_skin_draws_pmidx = g_skin_defnz = g_skin_snapped = 0;
 }
 
 static uint64_t DLStateHash() {
@@ -565,6 +592,26 @@ static void ExpandDisplayList(uint32_t addr, uint32_t size,
                     for (int i = 0; i < num && i < (int)c.payload.size(); i++)
                         c.payload[i] =
                             nwii::runtime::g_mmu->read_f32(base + i * 4);
+                    if (c.reg < 256 || (c.reg >= 0x400 && c.reg < 0x460))
+                        ParseApplyMatrixWrite(c.reg, c.payload);
+                } else if (c.type == GXCommandType::XFRegister &&
+                           (c.reg < 256 || (c.reg >= 0x400 && c.reg < 0x460))) {
+                    // Direct matrix write cached in the DL: feed the parse
+                    // shadow so re-snapshots below stay live.
+                    ParseApplyMatrixWrite(c.reg, c.payload);
+                } else if (c.type == GXCommandType::DrawPrimitive && c.raw &&
+                           c.raw->have_snap_mtx) {
+                    // Re-snapshot the matrix from the current parse shadow so a
+                    // cached skinned draw animates instead of freezing at the
+                    // pose from when it was first parsed. (raw is shared_ptr;
+                    // copy before mutating so the cache entry stays pristine.)
+                    c.raw = std::make_shared<DrawRaw>(*c.raw);
+                    uint32_t pb = (uint32_t)c.raw->defPosMtxIdx * 4;
+                    uint32_t nb = 3u * (c.raw->defPosMtxIdx & 31);
+                    if (pb + 12 <= 256 && nb + 9 <= 96) {
+                        std::memcpy(c.raw->snap_pos_mtx, &g_parse_posmtx[pb], 12 * sizeof(float));
+                        std::memcpy(c.raw->snap_nrm_mtx, &g_parse_nrmmtx[nb], 9 * sizeof(float));
+                    }
                 }
             }
             auto dl1 = std::chrono::steady_clock::now();
@@ -711,6 +758,26 @@ void FifoParser::DecodeDraw(GXCommand& c) {
                              r.vat.texElements[t] ? 2 : 1, false);
         if (off > buf_size)
             return;
+
+        // Transform by the per-draw matrix snapshot (GX 3x4). Doing it here,
+        // with the matrix captured at this draw's stream position, fixes the
+        // matrix-swap skinning scramble where a live render-time lookup would
+        // use whatever matrix was written last.
+        if (r.have_snap_mtx && vtx.has_pos) {
+            const float* m = r.snap_pos_mtx;
+            float x = vtx.pos[0], y = vtx.pos[1], z = vtx.pos[2];
+            vtx.pos[0] = m[0]*x + m[1]*y + m[2]*z + m[3];
+            vtx.pos[1] = m[4]*x + m[5]*y + m[6]*z + m[7];
+            vtx.pos[2] = m[8]*x + m[9]*y + m[10]*z + m[11];
+            if (vtx.has_norm) {
+                const float* n = r.snap_nrm_mtx;
+                float a = vtx.norm[0], b = vtx.norm[1], cc = vtx.norm[2];
+                vtx.norm[0] = n[0]*a + n[1]*b + n[2]*cc;
+                vtx.norm[1] = n[3]*a + n[4]*b + n[5]*cc;
+                vtx.norm[2] = n[6]*a + n[7]*b + n[8]*cc;
+            }
+            vtx.pre_xf = true;
+        }
         c.vertices.push_back(vtx);
     }
     c.raw.reset(); // decoded: drop the raw copy
@@ -801,6 +868,8 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                 }
                 if (g_skindbg && xf_addr < 0x100 && (xf_addr % 4) == 0)
                     g_skin_loaded_rows |= (1ull << (xf_addr / 4));
+                if (xf_addr < 256 || (xf_addr >= 0x400 && xf_addr < 0x460))
+                    ParseApplyMatrixWrite(xf_addr, c.payload);
                 commands.push_back(std::move(c));
             }
             offset += 5;
@@ -891,6 +960,9 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                 std::memcpy(&c.payload[i], &val, 4);
             }
 
+            if (c.reg < 256 || (c.reg >= 0x400 && c.reg < 0x460))
+                ParseApplyMatrixWrite(c.reg, c.payload);
+
             commands.push_back(std::move(c));
 
             offset += total_size;
@@ -920,10 +992,31 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             c.raw->vat = vat;
             c.raw->defPosMtxIdx = g_state.defPosMtxIdx;
             std::memcpy(c.raw->defTexMtxIdx, g_state.defTexMtxIdx, 8);
+            // Snapshot this draw's position/normal matrix from the parse-time
+            // shadow, unless the draw carries a per-vertex matrix index (then
+            // each vertex may use a different matrix — fall back to live).
+            if (!vat.posMatIdx) {
+                uint32_t pb = (uint32_t)g_state.defPosMtxIdx * 4;
+                uint32_t nb = 3u * (g_state.defPosMtxIdx & 31);
+                if (pb + 12 <= 256 && nb + 9 <= 96) {
+                    const float* pm = &g_parse_posmtx[pb];
+                    // Only trust the snapshot if the slot was actually written
+                    // (a zero matrix = never loaded in the parse shadow) — else
+                    // fall back to the renderer's live matrix.
+                    bool nonzero = false;
+                    for (int k = 0; k < 12 && !nonzero; ++k) nonzero = pm[k] != 0.0f;
+                    if (nonzero) {
+                        std::memcpy(c.raw->snap_pos_mtx, pm, 12 * sizeof(float));
+                        std::memcpy(c.raw->snap_nrm_mtx, &g_parse_nrmmtx[nb], 9 * sizeof(float));
+                        c.raw->have_snap_mtx = true;
+                    }
+                }
+            }
             if (g_skindbg) {
                 g_skin_draws_total++;
                 if (vat.posMatIdx) g_skin_draws_pmidx++;
                 if (g_state.defPosMtxIdx != 0) g_skin_defnz++;
+                if (c.raw->have_snap_mtx) g_skin_snapped++;
             }
             // Normals only matter when a colour channel is lit (XF 0x100e/0x100f
             // bit1); decoding them otherwise is pure cost.
@@ -933,6 +1026,49 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             std::memcpy(c.raw->arrayStride, g_state.arrayStride, sizeof(c.raw->arrayStride));
             c.raw->count = vtx_count;
             c.raw->bytes.assign(fifo.begin() + offset + 3, fifo.begin() + offset + need);
+            static const bool vatdbg = std::getenv("NWII_VATDBG") != nullptr;
+            if (vatdbg) {
+                // Compact VAT signature: does the computed vsize land the next
+                // byte on a plausible opcode? If not, vsize is wrong.
+                uint8_t nb = (offset + need < fifo_size) ? fifo[offset + need] : 0;
+                bool good = (nb==0||nb==0x08||nb==0x10||nb==0x61||nb==0x40||nb==0x48||
+                             (nb>=0x20&&nb<=0x38)||(nb>=0x80&&nb<=0xBF));
+                uint32_t sig = (vat.posMatIdx?1:0) | ((uint32_t)vat.posType<<1) |
+                    ((uint32_t)vat.posElements<<4) | ((uint32_t)vat.nrmMask<<5) |
+                    ((uint32_t)vat.nrmType<<7) | ((uint32_t)vat.nrmElements<<10) |
+                    ((uint32_t)vat.clrMask[0]<<11) | ((uint32_t)vat.clrType[0]<<13) |
+                    ((uint32_t)vat.texMask[0]<<16) | ((uint32_t)vat.texType[0]<<18);
+                static std::map<uint32_t,std::pair<uint64_t,uint64_t>> sigs; // sig->(count,badnext)
+                auto& e = sigs[sig]; e.first++;
+                if(!good){ e.second++;
+                    // scan forward for the next plausible opcode to learn the
+                    // TRUE payload size, vs our computed 'need'.
+                    size_t scan=offset+3;
+                    while(scan<fifo_size && scan<offset+3+(size_t)vtx_count*64){
+                        uint8_t b=fifo[scan];
+                        if(b==0||b==0x08||b==0x10||b==0x61||b==0x40||b==0x48||
+                           (b>=0x20&&b<=0x38)||(b>=0x80&&b<=0xBF)) break;
+                        scan++;
+                    }
+                    size_t actual_payload=scan-(offset+3);
+                    static int shown=0;
+                    if(shown++<30 && vtx_count>0)
+                        printf("[SZERR] vtx_count=%u our_vsize=%zu our_need=%zu actual_payload=%zu actual_per_vtx=%.2f nextbyte=0x%02X\n",
+                            vtx_count, VertexSize(vat), need-3, actual_payload,
+                            (double)actual_payload/vtx_count, scan<fifo_size?fifo[scan]:0);
+                }
+                static auto t0=std::chrono::steady_clock::now();
+                auto now=std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now-t0).count()>=2){
+                    t0=now;
+                    printf("[VAT] sig(posMI,posT,posE,nrmM,nrmT,nrmE,clrM,clrT,texM,texT)=count/badnext vsize:\n");
+                    for(auto&kv:sigs){uint32_t g=kv.first;
+                        printf("  (%d,%d,%d,%d,%d,%d,%d,%d,%d,%d)=%llu/%llu sz=%zu\n",
+                        g&1,(g>>1)&7,(g>>4)&1,(g>>5)&3,(g>>7)&7,(g>>10)&1,(g>>11)&3,(g>>13)&7,(g>>16)&3,(g>>18)&7,
+                        (unsigned long long)kv.second.first,(unsigned long long)kv.second.second,VertexSize(vat));}
+                    sigs.clear();
+                }
+            }
             g_prof_draws++;
             g_prof_draw_bytes += need;
 
@@ -942,6 +1078,28 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                 std::chrono::steady_clock::now() - sn0).count();
         } else {
             g_prof_unknown++;
+            // NWII_DESYNC: histogram the byte the parser can't recognise, plus
+            // the 3 bytes before it (where the previous command over/under-ran).
+            static const bool desync = std::getenv("NWII_DESYNC") != nullptr;
+            if (desync) {
+                static uint64_t hist[256] = {0};
+                static auto t0 = std::chrono::steady_clock::now();
+                hist[fifo[offset]]++;
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 2) {
+                    t0 = now;
+                    printf("[DESYNC] top unknown opcodes:");
+                    for (int pass = 0; pass < 6; pass++) {
+                        int bi = 0; uint64_t bv = 0;
+                        for (int i = 0; i < 256; i++) if (hist[i] > bv) { bv = hist[i]; bi = i; }
+                        if (!bv) break;
+                        printf(" 0x%02X:%llu", bi, (unsigned long long)bv);
+                        hist[bi] = 0;
+                    }
+                    printf("\n");
+                    for (int i = 0; i < 256; i++) hist[i] = 0;
+                }
+            }
             offset++;
         }
     }

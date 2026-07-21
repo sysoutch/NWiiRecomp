@@ -20,6 +20,9 @@ struct VertexData {
 
     bool has_pos = false;
     bool has_norm = false;
+    // Position/normal already transformed to view space at decode time (using
+    // the per-draw matrix snapshot); the renderer must not transform again.
+    bool pre_xf = false;
     bool has_color = false;
     bool has_tex[8] = {false};
 

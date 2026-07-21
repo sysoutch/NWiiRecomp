@@ -239,7 +239,9 @@ static void EmitVertex(const VertexData &vtx) {
   } else {
     bv.r = bv.g = bv.b = bv.a = 1.f;
   }
-  if (vtx.has_norm) {
+  if (vtx.has_norm && vtx.pre_xf) {
+    bv.nx = vtx.norm[0]; bv.ny = vtx.norm[1]; bv.nz = vtx.norm[2];
+  } else if (vtx.has_norm) {
     // Normal matrix for a position matrix index: 3 * (idx & 31), three rows
     // of three (Dolphin VertexShaderManager).
     int nb = 3 * (vtx.posMtxIdx & 31);
@@ -275,7 +277,12 @@ static void EmitVertex(const VertexData &vtx) {
 
   float x = vtx.pos[0], y = vtx.pos[1], z = vtx.pos[2];
   int mtx_base = vtx.posMtxIdx * 4;
-  if (vtx.has_pos && mtx_base + 12 <= 256) {
+  if (vtx.pre_xf) {
+    // Already transformed at decode with the per-draw matrix snapshot.
+    bv.x = x;
+    bv.y = y;
+    bv.z = z;
+  } else if (vtx.has_pos && mtx_base + 12 <= 256) {
     const float *mm = g_state.posMatrices;
     bv.x = x * mm[mtx_base + 0] + y * mm[mtx_base + 1] + z * mm[mtx_base + 2] +
            mm[mtx_base + 3];
