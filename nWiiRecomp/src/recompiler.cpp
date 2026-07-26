@@ -745,12 +745,46 @@ bool Recompiler::generate_cmake_project(uint32_t entry_point) {
     return false;
   }
 
+  // Copy the runtime sources, and only the sources.
+  //
+  // A plain recursive copy takes the source tree's own `build` directory with
+  // it — CMake caches, object files, fetched dependencies and their `.git`
+  // packs. Those are read-only inside git object stores, so the copy dies on
+  // the first pack file and the whole export fails. It also happens to be the
+  // last step, so everything generated up to that point was silently thrown
+  // away, including the SDK symbol report.
   std::string runtime_dest = config_.output_dir + "/nWiiRuntime";
   try {
-    std::filesystem::copy(
-        config_.runtime_source_dir, runtime_dest,
-        std::filesystem::copy_options::recursive |
-            std::filesystem::copy_options::overwrite_existing);
+    namespace fs = std::filesystem;
+    const fs::path src = config_.runtime_source_dir;
+    const auto opts = fs::copy_options::overwrite_existing;
+
+    auto skip = [](const fs::path &rel) {
+      for (const auto &part : rel)
+      {
+        const std::string s = part.string();
+        if (s == "build" || s == ".git" || s == ".cache" || s == ".DS_Store")
+          return true;
+      }
+      return false;
+    };
+
+    fs::create_directories(runtime_dest);
+    for (auto it = fs::recursive_directory_iterator(src);
+         it != fs::recursive_directory_iterator(); ++it)
+    {
+      const fs::path rel = fs::relative(it->path(), src);
+      if (skip(rel))
+      {
+        if (it->is_directory()) it.disable_recursion_pending();
+        continue;
+      }
+      const fs::path dest = fs::path(runtime_dest) / rel;
+      if (it->is_directory())
+        fs::create_directories(dest);
+      else if (it->is_regular_file())
+        fs::copy_file(it->path(), dest, opts);
+    }
   } catch (const std::exception &e) {
     std::cerr << "Failed to copy runtime from " << config_.runtime_source_dir
               << ": " << e.what() << "\n";

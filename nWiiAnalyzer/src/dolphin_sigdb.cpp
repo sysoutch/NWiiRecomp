@@ -29,11 +29,23 @@ bool DolphinSigDB::load_dsy(const std::string& path) {
         if (!f)
             break;
         rec.name[sizeof(rec.name) - 1] = 0;
-        db_[rec.checksum] = {rec.name, rec.size};
+        auto it = db_.find(rec.checksum);
+        if (it == db_.end())
+        {
+            db_[rec.checksum] = {rec.name, rec.size, false};
+        }
+        else if (it->second.name != rec.name || it->second.size != rec.size)
+        {
+            // Two different SDK functions hash the same. Neither name can be
+            // trusted for this checksum, so the entry stops naming anything.
+            if (!it->second.ambiguous) ++ambiguous_;
+            it->second.ambiguous = true;
+        }
     }
 
-    std::cout << "[SigDB] Loaded " << db_.size() << " signatures from "
-              << path << std::endl;
+    std::cout << "[SigDB] Loaded " << db_.size() << " signatures from " << path
+              << " (" << ambiguous_ << " checksums ambiguous within the DB)"
+              << std::endl;
     return !db_.empty();
 }
 

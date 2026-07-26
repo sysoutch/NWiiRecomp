@@ -286,6 +286,7 @@ namespace {
                 g_state.vat[i].nrmMask    = (VtxAttrMask)((val >> 11) & 3);
                 g_state.vat[i].clrMask[0] = (VtxAttrMask)((val >> 13) & 3);
                 g_state.vat[i].clrMask[1] = (VtxAttrMask)((val >> 15) & 3);
+                g_state.vat[i].nrmIndex3  = ((val >> 31) & 1) != 0;
             }
         } else if (reg == 0x60) {
             
@@ -677,7 +678,16 @@ namespace {
         for (int t = 0; t < 8; t++)
             if (vat.texMatIdx[t]) sz++;
         sz += AttrBytes(vat.posMask, vat.posType, vat.posElements ? 3 : 2, false);
-        sz += AttrBytes(vat.nrmMask, vat.nrmType, vat.nrmElements ? 9 : 3, false);
+        {
+            size_t nrm = AttrBytes(vat.nrmMask, vat.nrmType,
+                                   vat.nrmElements ? 9 : 3, false);
+            // Three indices, not one, when NBT normals come in by index.
+            if (vat.nrmIndex3 && vat.nrmElements &&
+                (vat.nrmMask == VtxAttrMask::Index8 ||
+                 vat.nrmMask == VtxAttrMask::Index16))
+                nrm *= 3;
+            sz += nrm;
+        }
         for (int ci = 0; ci < 2; ci++)
             sz += AttrBytes(vat.clrMask[ci], vat.clrType[ci], 1, true);
         for (int t = 0; t < 8; t++)
@@ -722,6 +732,17 @@ void FifoParser::DecodeDraw(GXCommand& c) {
             return;
         // CLR1 and tex1-7 are parsed for stream position only (the renderer
         // uses clr0/tex0). Normals are decoded only for lit draws.
+        // Three indices when NBT normals arrive by index: consume the extra two
+        // so the stream position stays right even though only the normal is
+        // used. Getting this wrong is invisible on this vertex and fatal on
+        // every one after it.
+        const bool nrm_idx3 =
+            r.vat.nrmIndex3 && r.vat.nrmElements &&
+            (r.vat.nrmMask == VtxAttrMask::Index8 ||
+             r.vat.nrmMask == VtxAttrMask::Index16);
+        const size_t nrm_idx_bytes =
+            (r.vat.nrmMask == VtxAttrMask::Index16) ? 2 : 1;
+
         if (r.vat.nrmMask != VtxAttrMask::None && r.need_normal) {
             vtx.has_norm = true;
             float nbt[9];
@@ -729,10 +750,12 @@ void FifoParser::DecodeDraw(GXCommand& c) {
                                 0, r.arrayBase[1], r.arrayStride[1],
                                 r.vat.nrmElements ? 9 : 3, nbt))
                 return;
+            if (nrm_idx3) off += 2 * nrm_idx_bytes;
             vtx.norm[0] = nbt[0]; vtx.norm[1] = nbt[1]; vtx.norm[2] = nbt[2];
         } else {
             off += AttrBytes(r.vat.nrmMask, r.vat.nrmType,
                              r.vat.nrmElements ? 9 : 3, false);
+            if (nrm_idx3) off += 2 * nrm_idx_bytes;
         }
         if (r.vat.clrMask[0] != VtxAttrMask::None) {
             float col[4];

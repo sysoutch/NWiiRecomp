@@ -4,6 +4,10 @@
 #include "ppc/instruction.h"
 #include "analyzer/signature_scanner.h"
 #include <iostream>
+#include <cctype>
+#include <algorithm>
+#include <string>
+#include <vector>
 #include <map>
 #include <queue>
 #include <algorithm>
@@ -344,30 +348,143 @@ int Analyzer::apply_signature_db(const std::string& dsy_path) {
     return 0;
   }
 
-  int matched = 0;
+  // Naming has to be trustworthy before anything can be hooked by name, and by
+  // default it was not. Measured on the shipped databases: 80% of the names
+  // resolved for NFS Hot Pursuit 2 landed on more than one address — `DBClose`
+  // alone claimed 257 of them — and names from entirely different games (J3D,
+  // nw4hbm, cPlayer) appeared throughout.
+  //
+  // The cause is the checksum: it is a faithful port of Dolphin's, which hashes
+  // opcode bits only and discards every operand. Two functions with the same
+  // instruction sequence therefore hash alike, and short functions do so
+  // constantly. Dolphin can live with that because a human reads the result;
+  // generated hooks cannot.
+  //
+  // Two rules make it usable. Neither invents information: both only decline to
+  // claim what the data does not support.
+  //
+  //   1. A function must be long enough for its opcode sequence to mean
+  //      something. Below this, matches are noise.
+  //   2. A name may be used once. If a name matches several addresses, the
+  //      signature does not identify a single function and none of them get it.
+  constexpr size_t kMinInstructions = 8;
+
+  struct Candidate { uint32_t addr; std::string name; };
+  std::vector<Candidate> candidates;
+  size_t too_short = 0, size_mismatch = 0, ambiguous_entry = 0;
+
   for (auto &pair : functions_) {
     Function &func = pair.second;
     if (func.instructions.empty())
       continue;
+    if (func.instructions.size() < kMinInstructions) { ++too_short; continue; }
+
     std::vector<uint32_t> opcodes;
     opcodes.reserve(func.instructions.size());
     for (const auto &inst : func.instructions)
       opcodes.push_back(inst.opcode);
 
     uint32_t sum = DolphinSigDB::checksum(opcodes);
-    if (const DolphinSigDB::Entry *e = db.match(sum)) {
+    const DolphinSigDB::Entry *e = db.match(sum);
+    if (!e) continue;
+    if (e->ambiguous) { ++ambiguous_entry; continue; }
+    if (e->size != (uint32_t)opcodes.size() * 4) { ++size_mismatch; continue; }
 
-      uint32_t our_size = (uint32_t)opcodes.size() * 4;
-      if (e->size == our_size) {
-        func.sdk_name = e->name;
-        matched++;
-      }
-    }
+    candidates.push_back({pair.first, e->name});
   }
+
+  std::map<std::string, int> uses;
+  for (const auto &c : candidates) ++uses[c.name];
+
+  // Disambiguate the rest by library locality.
+  //
+  // A name that matched several addresses does not identify a function on its
+  // own — but the SDK is linked in contiguous blocks, one per object file, so
+  // location carries information the checksum lost. The DB records which
+  // library each signature came from (the name carries a trailing
+  // "\tgx.a GXTexture.o"), and the confident matches pin down where each
+  // library sits. A duplicate with exactly one candidate inside its own
+  // library's span is then no longer ambiguous.
+  //
+  // Measured on NFS Hot Pursuit 2: the five GX names that survive uniqueness
+  // alone all land in 0x801B8000..0x801BC200, and the four that used to be
+  // "found" outside it were the false ones.
+  //
+  // This still invents nothing. It only uses a fact about how the code was
+  // linked, and it only ever narrows a set of candidates the checksum already
+  // produced. Repeating the pass lets a widened span settle more names.
+  auto library_of = [](const std::string &name) -> std::string {
+    const size_t tab = name.find('\t');
+    if (tab == std::string::npos) return {};
+    size_t b = tab + 1;
+    while (b < name.size() && std::isspace((unsigned char)name[b])) ++b;
+    size_t e = b;
+    while (e < name.size() && !std::isspace((unsigned char)name[e])) ++e;
+    return name.substr(b, e - b);
+  };
+
+  std::map<uint32_t, std::string> accepted;   // address -> name
+  for (const auto &c : candidates)
+    if (uses[c.name] == 1) accepted[c.addr] = c.name;
+
+  int by_locality = 0;
+  for (int round = 0; round < 8; ++round) {
+    struct Span { uint32_t lo, hi; };
+    std::map<std::string, Span> spans;
+    for (const auto &[addr, name] : accepted) {
+      const std::string lib = library_of(name);
+      if (lib.empty()) continue;
+      auto it = spans.find(lib);
+      if (it == spans.end()) spans[lib] = {addr, addr};
+      else { it->second.lo = std::min(it->second.lo, addr);
+             it->second.hi = std::max(it->second.hi, addr); }
+    }
+
+    int gained = 0;
+    std::map<std::string, std::vector<uint32_t>> byName;
+    for (const auto &c : candidates)
+      if (uses[c.name] > 1 && !accepted.count(c.addr))
+        byName[c.name].push_back(c.addr);
+
+    for (const auto &[name, addrs] : byName) {
+      const std::string lib = library_of(name);
+      auto sp = spans.find(lib);
+      if (lib.empty() || sp == spans.end()) continue;
+
+      uint32_t only = 0;
+      int inside = 0;
+      for (uint32_t a : addrs)
+        if (a >= sp->second.lo && a <= sp->second.hi) { ++inside; only = a; }
+
+      if (inside == 1) { accepted[only] = name; ++gained; }
+    }
+
+    by_locality += gained;
+    if (!gained) break;
+  }
+
+  int matched = 0;
+  for (const auto &[addr, name] : accepted) {
+    functions_[addr].sdk_name = name;
+    ++matched;
+  }
+  const int rejected_duplicate = (int)candidates.size() - matched;
+
+  std::cout << "[Analyzer] Signature DB: " << matched << " named, "
+            << by_locality << " of them settled by library locality, "
+            << rejected_duplicate << " still ambiguous, "
+            << ambiguous_entry << " ambiguous in the DB, "
+            << size_mismatch << " size mismatch, "
+            << too_short << " below " << kMinInstructions << " instructions\n";
+  return matched;
+}
+
+#if 0
   std::cout << "[Analyzer] Signature DB matched " << matched << " of "
             << functions_.size() << " functions\n";
   return matched;
 }
+#endif
 
 } 
 } 

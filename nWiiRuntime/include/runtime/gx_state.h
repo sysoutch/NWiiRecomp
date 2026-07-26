@@ -19,6 +19,11 @@ struct VATSlot {
   VtxAttrMask nrmMask;
   VtxAttrType nrmType;
   bool nrmElements; 
+  // VCD (CP 0x50) bit 31. With NBT normals supplied by index, the stream
+  // carries three indices — normal, binormal, tangent — instead of one.
+  // Ignoring it under-counts every such vertex by two or four bytes, and the
+  // parser then reads the next vertex from the wrong offset.
+  bool nrmIndex3 = false;
   VtxAttrMask clrMask[2];
   VtxAttrType clrType[2];
   bool clrElements[2]; 
