@@ -36,6 +36,9 @@ add_library(nwiiruntime STATIC
     src/hle/pad.cpp
     src/hle/dvd.cpp
     src/hle/gx/fifo_parser.cpp
+    src/hle/gx/gx_matrix_seam.cpp
+    src/hle/gx/gx_state_seam.cpp
+    src/hle/gx/gx_state_seam.cpp
     src/hle/gx/renderer_gl.cpp
     src/hle/gx/renderer_factory.cpp
     src/hle/gx/tev_shader_gen.cpp
@@ -52,13 +55,10 @@ add_library(nwiiruntime STATIC
     src/hw/hw_pe.cpp
     src/hw/hw_vi.cpp
     src/hw/hw_dsp.cpp
-    src/hw/hw_exi.cpp
-    src/hw/hw_si.cpp
     src/hw/hw_ai.cpp
     src/hw/hw_di.cpp
     src/hw/hw_ipc.cpp
     src/hw/hw_all.cpp
-    src/hw/hw_mi.cpp
     src/hw/hw_cp.cpp
     src/hle/devices/di_device.cpp
     src/hle/devices/fs_device.cpp

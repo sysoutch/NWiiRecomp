@@ -43,12 +43,9 @@ uint32_t cp_fifo_base_reg();
 void register_pe(MMIODispatcher &dispatcher);
 void register_vi(MMIODispatcher &dispatcher);
 void register_dsp(MMIODispatcher &dispatcher);
-void register_exi(MMIODispatcher &dispatcher);
-void register_si(MMIODispatcher &dispatcher);
 void register_ai(MMIODispatcher &dispatcher);
 void register_di(MMIODispatcher &dispatcher);
 void register_ipc(MMIODispatcher &dispatcher);
-void register_mi(MMIODispatcher &dispatcher);
 
 void register_all_hw(MMIODispatcher &dispatcher);
 

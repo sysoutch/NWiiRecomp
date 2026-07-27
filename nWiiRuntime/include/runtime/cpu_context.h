@@ -27,6 +27,8 @@ struct ConditionField {
 void GX_WGPIPE_Write8(uint8_t val);
 void GX_WGPIPE_Write16(uint16_t val);
 void GX_WGPIPE_Write32(uint32_t val);
+void GX_DL_Snapshot(uint32_t addr, uint32_t size);
+bool GX_DL_Fetch(uint32_t addr, uint32_t size, std::vector<uint8_t>& out);
 void GX_WGPIPE_WriteF32(float val);
 void GX_WGPIPE_WriteF64(double val);
 

@@ -1,3 +1,5 @@
+#include <iostream>
+#include <vector>
 #include "runtime/gx/fifo_parser.h"
 #include "runtime/gx_state.h"
 #include "runtime/cpu_context.h"
@@ -85,6 +87,7 @@ namespace {
             g_state.numTexGens = (val & 0xF);
             g_state.numChans = ((val >> 4) & 0x7);
             g_state.numTevStages = ((val >> 10) & 0xF) + 1;
+            g_state.cullMode = (val >> 14) & 3;
         } else if (reg >= 0x28 && reg <= 0x2F) {
 
             
@@ -559,6 +562,10 @@ static void ExpandDisplayList(uint32_t addr, uint32_t size,
 
     static const bool nocache = std::getenv("NWII_NODLCACHE") != nullptr;
     const uint8_t* src = nwii::runtime::g_mmu->get_ptr(0x80000000u | phys);
+    // Prefer the copy taken when the game actually made the call -- guest RAM
+    // may already hold the next frame's list by the time we get here.
+    std::vector<uint8_t> snap;
+    if (nwii::runtime::GX_DL_Fetch(addr, size, snap)) src = snap.data();
 
     if (src && !nocache && depth == 0) {
         // Sampled content hash: stride 512 plus the tail, cheap even for
@@ -786,7 +793,25 @@ void FifoParser::DecodeDraw(GXCommand& c) {
         // with the matrix captured at this draw's stream position, fixes the
         // matrix-swap skinning scramble where a live render-time lookup would
         // use whatever matrix was written last.
-        if (r.have_snap_mtx && vtx.has_pos) {
+        if (!r.snap_pos_bank.empty() && vtx.has_pos) {
+            const uint32_t pb = (uint32_t)vtx.posMtxIdx * 4;
+            const uint32_t nb = 3u * (vtx.posMtxIdx & 31);
+            if (pb + 12 <= 256 && nb + 9 <= 96) {
+                const float* m = &r.snap_pos_bank[pb];
+                float x = vtx.pos[0], y = vtx.pos[1], z = vtx.pos[2];
+                vtx.pos[0] = m[0]*x + m[1]*y + m[2]*z + m[3];
+                vtx.pos[1] = m[4]*x + m[5]*y + m[6]*z + m[7];
+                vtx.pos[2] = m[8]*x + m[9]*y + m[10]*z + m[11];
+                if (vtx.has_norm && !r.snap_nrm_bank.empty()) {
+                    const float* n = &r.snap_nrm_bank[nb];
+                    float a = vtx.norm[0], b = vtx.norm[1], cc = vtx.norm[2];
+                    vtx.norm[0] = n[0]*a + n[1]*b + n[2]*cc;
+                    vtx.norm[1] = n[3]*a + n[4]*b + n[5]*cc;
+                    vtx.norm[2] = n[6]*a + n[7]*b + n[8]*cc;
+                }
+                vtx.pre_xf = true;
+            }
+        } else if (r.have_snap_mtx && vtx.has_pos) {
             const float* m = r.snap_pos_mtx;
             float x = vtx.pos[0], y = vtx.pos[1], z = vtx.pos[2];
             vtx.pos[0] = m[0]*x + m[1]*y + m[2]*z + m[3];
@@ -853,6 +878,34 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             }
             ExpandDisplayList(dl_addr, dl_size, commands, depth);
             offset += 9;
+        } else if (cmd == 0x78) {
+            // Seam RMW marker (not a real GP opcode). Native GX handlers own
+            // only some bits of GEN_MODE / CMODE0 / CP 0x30; merging at call
+            // time raced this parser and used a base value up to a frame
+            // stale, clobbering the other fields (texgen counts, dither bits,
+            // texture matrix indices). The merge happens here instead, at the
+            // marker's position in the stream, so the base is always current.
+            if (offset + 11 > fifo_size) break;
+            uint8_t kind = fifo[offset + 1];
+            uint8_t reg  = fifo[offset + 2];
+            uint32_t mask = Read32(fifo, offset + 3);
+            uint32_t val  = Read32(fifo, offset + 7);
+            GXCommand c;
+            c.reg = reg;
+            if (kind == 0) {
+                uint32_t merged = (g_state.bp[reg] & ~mask) | (val & mask);
+                ParseBP(reg, merged);
+                c.type = GXCommandType::BPRegister;
+                c.val = merged;
+            } else {
+                uint32_t merged = (g_state.cp[reg] & ~mask) | (val & mask);
+                g_state.cp[reg] = merged;
+                ParseCP(reg, merged);
+                c.type = GXCommandType::CPRegister;
+                c.val = merged;
+            }
+            commands.push_back(std::move(c));
+            offset += 11;
         } else if (cmd == 0x48) {
             
             offset++;
@@ -1018,7 +1071,17 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             // Snapshot this draw's position/normal matrix from the parse-time
             // shadow, unless the draw carries a per-vertex matrix index (then
             // each vertex may use a different matrix — fall back to live).
-            if (!vat.posMatIdx) {
+            if (vat.posMatIdx) {
+                // Per-vertex matrix index: freeze the entire bank, because the
+                // vertices in this one draw will index different slots and the
+                // renderer's live copy is whatever the frame ended up with.
+                bool any = false;
+                for (int k = 0; k < 256 && !any; ++k) any = g_parse_posmtx[k] != 0.0f;
+                if (any) {
+                    c.raw->snap_pos_bank.assign(g_parse_posmtx, g_parse_posmtx + 256);
+                    c.raw->snap_nrm_bank.assign(g_parse_nrmmtx, g_parse_nrmmtx + 96);
+                }
+            } else {
                 uint32_t pb = (uint32_t)g_state.defPosMtxIdx * 4;
                 uint32_t nb = 3u * (g_state.defPosMtxIdx & 31);
                 if (pb + 12 <= 256 && nb + 9 <= 96) {

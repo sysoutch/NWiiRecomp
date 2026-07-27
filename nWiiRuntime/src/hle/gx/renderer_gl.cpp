@@ -49,6 +49,7 @@ struct BatchVertex {
 };
 
 static std::vector<BatchVertex> s_batch;
+static float s_proj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 static GLuint s_vao = 0, s_vbo = 0;
 static GLShader s_active_shader = {0};
 
@@ -182,6 +183,7 @@ static void ApplyProjection(GLint uProj) {
              g_state.projType, (int)g_state.projSet, sp[0], sp[1], sp[2], sp[3],
              sp[4], sp[5]);
   }
+  std::memcpy(s_proj, p, sizeof(s_proj));
   glUniformMatrix4fv(uProj, 1, GL_FALSE, p);
 }
 
@@ -204,8 +206,9 @@ static void ApplyZMode() {
 
 // Apply the GX blend state (BP 0x41 = PE_CMODE0). Without it every draw is
 // opaque, so alpha fades (the WARNING "press" blink), transparent UI and the
-// dialogue window never composite. src/dst factor tables follow Dolphin's
-// GX->GL mapping (src uses DST_COLOR at index 2/3, dst uses SRC_COLOR).
+// dialogue window never composite. The src/dst factor tables follow the
+// documented GX->GL factor order (src uses DST_COLOR at index 2/3, dst uses
+// SRC_COLOR).
 static void ApplyBlend() {
   uint32_t cm = g_state.bp[0x41];
   bool enable = cm & 1;
@@ -229,6 +232,30 @@ static void ApplyBlend() {
   }
 }
 
+// Backface culling from BP 0x00 (GEN_MODE), bits 14-15: 0 none, 1 cull back,
+// 2 cull front, 3 cull all.
+//
+// The subtlety is which way round GL is told about it. Our projection negates
+// Y, so a triangle that is counter-clockwise on the console arrives clockwise
+// here. Rather than fight that per draw, front-facing is declared clockwise and
+// the cull target left at GL's default back face; culling the front is then a
+// matter of declaring counter-clockwise instead. Switching glCullFace while
+// leaving the default GL_CCW winding removes the opposite half of the scene --
+// that is what took out foliage and text on the first attempt.
+//
+// NWII_NOCULL=1 disables culling entirely.
+static void ApplyCullMode() {
+  static const bool no_cull = std::getenv("NWII_NOCULL") != nullptr;
+  const uint8_t m = g_state.cullMode;
+  if (no_cull || m == 0) {
+    glDisable(GL_CULL_FACE);
+    return;
+  }
+  glEnable(GL_CULL_FACE);
+  glCullFace(m == 3 ? GL_FRONT_AND_BACK : GL_BACK);
+  glFrontFace(m == 2 ? GL_CCW : GL_CW);
+}
+
 static void EmitVertex(const VertexData &vtx) {
   BatchVertex bv = {0};
   if (vtx.has_color) {
@@ -243,7 +270,7 @@ static void EmitVertex(const VertexData &vtx) {
     bv.nx = vtx.norm[0]; bv.ny = vtx.norm[1]; bv.nz = vtx.norm[2];
   } else if (vtx.has_norm) {
     // Normal matrix for a position matrix index: 3 * (idx & 31), three rows
-    // of three (Dolphin VertexShaderManager).
+    // of three (XF normal matrix bank layout).
     int nb = 3 * (vtx.posMtxIdx & 31);
     const float *nm = g_state.normalMatrices;
     if (nb + 9 <= 96) {
@@ -490,6 +517,7 @@ static void SetupDrawState(const GXCommand &cmd) {
   ApplyProjection(s_active_shader.uProjMtx);
   ApplyZMode();
   ApplyBlend();
+  ApplyCullMode();
 
   for (int i = 0; i < 8; ++i) {
     if (g_state.texStages[i].base_addr != 0 && s_active_shader.uTex[i] >= 0) {

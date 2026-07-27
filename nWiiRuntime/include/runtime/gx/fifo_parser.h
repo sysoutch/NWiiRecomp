@@ -29,6 +29,11 @@ struct DrawRaw {
     bool have_snap_mtx = false;
     float snap_pos_mtx[12];
     float snap_nrm_mtx[9];
+    // Skinned draws pick a matrix per vertex, so one matrix is not enough --
+    // the whole bank has to be frozen at this draw's stream position. Empty for
+    // ordinary draws, so nothing is paid for them.
+    std::vector<float> snap_pos_bank;   // 256 floats = 64 slots of 3x4
+    std::vector<float> snap_nrm_bank;   // 96 floats  = 32 slots of 3x3
     uint16_t count;
     std::vector<uint8_t> bytes;
 };

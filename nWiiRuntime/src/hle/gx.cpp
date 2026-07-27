@@ -1,4 +1,5 @@
 
+#include <map>
 #include "runtime/cpu_context.h"
 
 namespace nwii::runtime { extern CPUContext *g_ctx_ptr; }
@@ -37,6 +38,37 @@ namespace nwii::runtime {
 
 std::mutex g_fifo_mutex;
 std::vector<uint8_t> g_hw_fifo;
+
+// Display lists are read out of guest RAM when the FIFO is parsed, which is
+// long after the game issued the call -- and the game double-buffers those
+// buffers, so by then the bytes can already belong to the next frame. The
+// GXCallDisplayList seam copies them at the moment of the call; the parser
+// takes the copy when one exists.
+static std::mutex g_dl_snap_mtx;
+static std::map<uint64_t, std::vector<uint8_t>> g_dl_snap;
+
+namespace nwii::runtime {
+void GX_DL_Snapshot(uint32_t addr, uint32_t size) {
+    if (!nwii::runtime::g_mmu || size == 0 || size > (8u << 20)) return;
+    std::vector<uint8_t> buf(size);
+    if (const uint8_t* p = nwii::runtime::g_mmu->get_ptr(0x80000000u | (addr & 0x03FFFFFF)))
+        std::memcpy(buf.data(), p, size);
+    else
+        for (uint32_t i = 0; i < size; ++i) buf[i] = nwii::runtime::g_mmu->read8(addr + i);
+    std::lock_guard<std::mutex> lk(g_dl_snap_mtx);
+    if (g_dl_snap.size() > 1024) g_dl_snap.clear();
+    g_dl_snap[((uint64_t)(addr & 0x03FFFFFF) << 24) ^ size] = std::move(buf);
+}
+
+bool GX_DL_Fetch(uint32_t addr, uint32_t size, std::vector<uint8_t>& out) {
+    std::lock_guard<std::mutex> lk(g_dl_snap_mtx);
+    auto it = g_dl_snap.find(((uint64_t)(addr & 0x03FFFFFF) << 24) ^ size);
+    if (it == g_dl_snap.end() || it->second.size() != size) return false;
+    out = it->second;
+    return true;
+}
+} // namespace nwii::runtime
+
 
 static std::vector<nwii::runtime::gx::GXCommand> s_carry;
 

@@ -85,6 +85,10 @@ struct GXState {
   uint8_t defTexMtxIdx[8] = {0};
 
   uint8_t numTevStages;
+  // BP 0x00 (GEN_MODE) bits 14-15: 0 none, 1 front, 2 back, 3 all.
+  uint8_t cullMode = 0;
+  // Per-draw tally of which cull modes were actually in force.
+  uint32_t cullHist[4] = {0, 0, 0, 0};
   uint8_t numTexGens;
   uint8_t numChans;
   TEVStage tevStages[16];

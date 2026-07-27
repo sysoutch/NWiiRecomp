@@ -16,85 +16,70 @@ Recompiler::Recompiler(const analyzer::Analyzer &analyzer,
                        const RecompilerConfig &config)
     : analyzer_(analyzer), symbols_(symbols), config_(config) {}
 
-static bool is_hle_function(const std::string &name) {
-
-  
-
-  
-  
-  static const std::unordered_set<std::string> known_hle_functions = {
-      "AXAcquireVoice",
-      "AXFreeVoice",
-      "AXInit",
-      "AXSetVoiceAdpcm",
-      "AXSetVoiceMix",
-      "AXSetVoiceOffsets",
-      "AXSetVoiceSrc",
-      "AXSetVoiceState",
-      "DVDClose",
-      "DVDGetDriveStatus",
-      "DVDInit",
-      "DVDOpen",
-      "DVDReadAsyncPrio",
-      "DVDReadPrio",
-      "DVD_Callback",
-      "GXBegin",
-      "GXEnd",
-      "GXGetCPUFifo",
-      "GXInit",
-      "GXInitFifoBase",
-      "GXInitFifoPtrs",
-      "GXSetCPUFifo",
-      "GXSetCopyClear",
-      "GXSetVtxAttrFmt",
-      "GXSetVtxDesc",
-      "IOS_Close",
-      "IOS_CloseAsync",
-      "IOS_Ioctl",
-      "IOS_IoctlAsync",
-      "IOS_Ioctlv",
-      "IOS_IoctlvAsync",
-      "IOS_Open",
-      "IOS_OpenAsync",
-      "IOS_Read",
-      "IOS_ReadAsync",
-      "IOS_Seek",
-      "IOS_SeekAsync",
-      "IOS_Write",
-      "IOS_WriteAsync",
-      "KPADInit",
+static const std::unordered_set<std::string> &hle_handlers() {
+  // Native handlers that actually exist in nWiiRuntime. Binding is by symbol
+  // name, so any game whose symbols the analyzer can name gets the whole seam
+  // with no per-game configuration; [hle_hooks] in the TOML stays available for
+  // overrides and for games where a symbol is missed.
+  //
+  // Deliberately conservative: only handlers that have been run and checked in
+  // a real game are listed. Binding DVDReadAsyncPrio automatically loaded the
+  // game's DLL as zeros and gave a black screen, so disc, audio, IOS and the
+  // remaining VI entry points stay out until each is verified on its own. They
+  // can still be forced per game through [hle_hooks].
+  //
+  // GXLoadTexMtxImm and GXCallDisplayList are deliberately absent: both are
+  // implemented but broke rendering in Mario Party 7, so they stay opt-in via
+  // the TOML until that is understood.
+  static const std::unordered_set<std::string> s = {
+      "GXLoadNrmMtxImm",
+      "GXLoadPosMtxImm",
+      "GXSetAlphaCompare",
+      "GXSetBlendMode",
+      "GXSetCullMode",
+      "GXSetCurrentMtx",
+      "GXSetDstAlpha",
+      "GXSetNumTevStages",
+      "GXSetScissor",
+      "GXSetZCompLoc",
+      "GXSetZMode",
       "OSAllocFromHeap",
       "OSCreateHeap",
-      "OSDisableInterrupts",
-      "OSEnableInterrupts",
       "OSFreeToHeap",
-      "OSGetArenaHi",
-      "OSGetArenaLo",
-      "OSGetCurrentThread",
-      "OSGetTime",
-      "OSInit",
       "OSInitAlloc",
       "OSReport",
-      "OSRestoreInterrupts",
-      "OSSetArenaHi",
-      "OSSetArenaLo",
-      "OSSleepThread",
-      "OSTicksToMilliseconds",
       "PADInit",
       "PADRead",
-      "VIConfigure",
-      "VIConfigurePan",
-      "VIGetNextField",
-      "VIInit",
-      "VISetBlack",
       "VIWaitForRetrace",
-      "WPADInit",
-      "WPADRead",
-      "iosAlloc",
-      "iosFree",
   };
-  return known_hle_functions.count(name) != 0;
+  return s;
 }
+
+// Symbols out of the signature database can carry the library they came from,
+// e.g. "GXSetCullMode\tgx.a GXGeometry.o" -- match on the bare name.
+static std::string bare_symbol(const std::string &name) {
+  size_t cut = name.find_first_of(" \t");
+  if (cut == std::string::npos) {
+    // By this point the name has usually been sanitised into an identifier,
+    // so the separator that followed the function name is now "__".
+    cut = name.find("__", 1);
+  }
+  std::string out = cut == std::string::npos ? name : name.substr(0, cut);
+  // Symbols also arrive carrying their own address, e.g. GXSetZMode_800C0CC0.
+  if (out.size() > 9) {
+    const size_t us = out.size() - 9;
+    if (out[us] == '_' &&
+        out.find_first_not_of("0123456789ABCDEFabcdef", us + 1) ==
+            std::string::npos)
+      out.resize(us);
+  }
+  return out;
+}
+
+static bool is_hle_function(const std::string &name) {
+  return hle_handlers().count(bare_symbol(name)) != 0;
+}
+
 
 std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
   std::vector<std::string> generated_files;
@@ -161,6 +146,27 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     hout << "void GXEnd(nwii::runtime::CPUContext& ctx);\n";
     hout << "void GXSetVtxDesc(nwii::runtime::CPUContext& ctx);\n";
     hout << "void GXSetVtxAttrFmt(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXLoadPosMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetCullMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetNumTevStages(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetBlendMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetZMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetZCompLoc(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetAlphaCompare(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetDstAlpha(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetScissor(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXCallDisplayList(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetCullMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetNumTevStages(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetBlendMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetZMode(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetZCompLoc(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetAlphaCompare(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetDstAlpha(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetScissor(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXLoadNrmMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXLoadTexMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    hout << "void GXSetCurrentMtx(nwii::runtime::CPUContext& ctx);\n";
     hout << "void IOS_Write(nwii::runtime::CPUContext& ctx);\n";
     hout << "void IOS_Seek(nwii::runtime::CPUContext& ctx);\n";
     hout << "void IOS_CloseAsync(nwii::runtime::CPUContext& ctx);\n";
@@ -196,6 +202,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     std::set<std::string> emitted_names;
     std::vector<std::string> all_func_names;
+    // The symbol name before any uniquifying suffix. The seam matches on this;
+    // the wrapper itself must never carry it, or it would collide with the
+    // native handler's own symbol at link time.
+    std::vector<std::string> all_base_names;
 
     hout << "extern \"C\" {\n";
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
@@ -208,6 +218,7 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
            << std::setw(8) << start_addr;
         func_name = ss.str();
       }
+      all_base_names.push_back(bare_symbol(func_name));
       if (emitted_names.count(func_name)) {
         std::stringstream ss;
         ss << func_name << "_" << std::hex << std::uppercase << start_addr;
@@ -242,11 +253,11 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
         out << "#include \"functions.h\"\n\n";
       }
 
-      std::string func_name = all_func_names[func_idx++];
-
-      if (!func.hle_hook_name.empty() || is_hle_function(func_name)) {
+      std::string func_name = all_func_names[func_idx];
+      const std::string &base_name = all_base_names[func_idx++];
+      if (!func.hle_hook_name.empty() || is_hle_function(base_name)) {
         std::string target =
-            !func.hle_hook_name.empty() ? func.hle_hook_name : func_name;
+            !func.hle_hook_name.empty() ? func.hle_hook_name : base_name;
         if (target != func_name) {
           out << "void " << func_name << "(nwii::runtime::CPUContext& ctx) {\n";
           out << "    " << target << "(ctx);\n";
@@ -296,8 +307,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     func_idx = 0;
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx++];
-      bool is_hle = !func.hle_hook_name.empty() || is_hle_function(func_name);
+      std::string func_name = all_func_names[func_idx];
+      bool is_hle = !func.hle_hook_name.empty() ||
+                    is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
       if (!is_hle) {
         out << "    {0x" << std::hex << std::uppercase << start_addr << ", 0x"
             << func.end_address << ", " << func_name << "},\n";
@@ -369,8 +382,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     func_idx = 0;
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx++];
-      bool is_hle = !func.hle_hook_name.empty() || is_hle_function(func_name);
+      std::string func_name = all_func_names[func_idx];
+      bool is_hle = !func.hle_hook_name.empty() ||
+                    is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
 
       if (emitted_cases.insert(start_addr).second) {
         if (is_hle) {
@@ -462,6 +477,7 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     std::set<std::string> emitted_names;
     std::vector<std::string> all_func_names;
+    std::vector<std::string> all_base_names;
 
     out << "// --- Forward Declarations ---\n";
     out << "extern \"C\" {\n";
@@ -500,6 +516,27 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     out << "void GXEnd(nwii::runtime::CPUContext& ctx);\n";
     out << "void GXSetVtxDesc(nwii::runtime::CPUContext& ctx);\n";
     out << "void GXSetVtxAttrFmt(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXLoadPosMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetCullMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetNumTevStages(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetBlendMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetZMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetZCompLoc(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetAlphaCompare(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetDstAlpha(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetScissor(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXCallDisplayList(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetCullMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetNumTevStages(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetBlendMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetZMode(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetZCompLoc(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetAlphaCompare(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetDstAlpha(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetScissor(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXLoadNrmMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXLoadTexMtxImm(nwii::runtime::CPUContext& ctx);\n";
+    out << "void GXSetCurrentMtx(nwii::runtime::CPUContext& ctx);\n";
     out << "void IOS_Write(nwii::runtime::CPUContext& ctx);\n";
     out << "void IOS_Seek(nwii::runtime::CPUContext& ctx);\n";
     out << "void IOS_CloseAsync(nwii::runtime::CPUContext& ctx);\n";
@@ -541,6 +578,7 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
            << std::setw(8) << start_addr;
         func_name = ss.str();
       }
+      all_base_names.push_back(bare_symbol(func_name));
       if (emitted_names.count(func_name)) {
         std::stringstream ss;
         ss << func_name << "_" << std::hex << std::uppercase << start_addr;
@@ -554,8 +592,9 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     out << "\n// --- Function Bodies ---\n";
     int func_idx = 0;
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx++];
-      if (!func.hle_hook_name.empty() || is_hle_function(func_name)) {
+      std::string func_name = all_func_names[func_idx];
+      const std::string &base_name = all_base_names[func_idx++];
+      if (!func.hle_hook_name.empty() || is_hle_function(base_name)) {
         out << "// [HLE Hook] Skipping generation for " << func_name << "\n\n";
       } else {
         emit_function(out, func, func_name);
@@ -579,8 +618,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     func_idx = 0;
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx++];
-      bool is_hle = !func.hle_hook_name.empty() || is_hle_function(func_name);
+      std::string func_name = all_func_names[func_idx];
+      bool is_hle = !func.hle_hook_name.empty() ||
+                    is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
       if (!is_hle) {
         out << "    {0x" << std::hex << std::uppercase << start_addr << ", 0x"
             << func.end_address << ", " << func_name << "},\n";
@@ -652,8 +693,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
     func_idx = 0;
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx++];
-      bool is_hle = !func.hle_hook_name.empty() || is_hle_function(func_name);
+      std::string func_name = all_func_names[func_idx];
+      bool is_hle = !func.hle_hook_name.empty() ||
+                    is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
 
       if (emitted_cases.insert(start_addr).second) {
         if (is_hle) {
