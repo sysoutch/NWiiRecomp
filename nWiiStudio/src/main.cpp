@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
             .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8
         };
         Texture2D texture = LoadTextureFromImage(image);
+        SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
         
         AudioStream audioStream = {0};
         
@@ -109,8 +110,35 @@ int main(int argc, char** argv) {
             }
             
             BeginDrawing();
-            ClearBackground(BLACK);
-            DrawTexture(texture, (GetScreenWidth() - width) / 2, (GetScreenHeight() - height) / 2, WHITE);
+            ClearBackground(WHITE);
+            
+            // Draw blurred/zoomed background blended with white
+            float scaleX = (float)GetScreenWidth() / width;
+            float scaleY = (float)GetScreenHeight() / height;
+            float bgScale = (scaleX > scaleY) ? scaleX : scaleY; // Fill screen
+            bgScale *= 1.2f; // Zoom in for the "blur" effect
+            
+            Rectangle sourceRec = { 0.0f, 0.0f, (float)width, (float)height };
+            Rectangle destRecBg = { 
+                (float)GetScreenWidth() / 2.0f, 
+                (float)GetScreenHeight() / 2.0f, 
+                width * bgScale, 
+                height * bgScale 
+            };
+            Vector2 bgOrigin = { destRecBg.width / 2.0f, destRecBg.height / 2.0f };
+            DrawTexturePro(texture, sourceRec, destRecBg, bgOrigin, 0.0f, Color{ 255, 255, 255, 128 });
+            
+            // Draw main video scaled to fit exactly
+            float videoScale = (scaleX < scaleY) ? scaleX : scaleY;
+            Rectangle destRecVideo = {
+                (float)GetScreenWidth() / 2.0f,
+                (float)GetScreenHeight() / 2.0f,
+                width * videoScale,
+                height * videoScale
+            };
+            Vector2 videoOrigin = { destRecVideo.width / 2.0f, destRecVideo.height / 2.0f };
+            DrawTexturePro(texture, sourceRec, destRecVideo, videoOrigin, 0.0f, WHITE);
+            
             EndDrawing();
         }
         
