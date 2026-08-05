@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include "rlImGui.h"
 
 static void ShowTooltip(const char* text, StudioState& state) {
     if (state.settings.showTooltips && ImGui::IsItemHovered()) {
@@ -66,6 +67,9 @@ void GUI::ApplySettings(StudioState& state) {
 void GUI::RebuildFontsIfNeeded(StudioState& state) {
     if (state.pendingFontRebuild.exchange(false)) {
         StyleManager::SetupFonts(state.settings);
+        // We need a proper way to recreate the raylib texture here,
+        // but for now we just let SetupFonts clear and rebuild the ImGui atlas
+        rlImGuiEndInitImGui(); 
     }
 }
 
