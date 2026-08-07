@@ -13,7 +13,7 @@
 <p align="center">
   <a href="SHOWCASE.md"><strong>View Media Showcase</strong></a>
   <br><br>
-  <a href="https://discord.gg/wp7zdxyqT">
+  <a href="https://discord.gg/A6w96BuMX">
     <img src="https://img.shields.io/badge/Discord-NWiiRecomp-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="NWiiRecomp Discord"/>
   </a>
   <br><br>
