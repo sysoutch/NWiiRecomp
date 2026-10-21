@@ -23,6 +23,9 @@ int main(int argc, char** argv) {
         
         config.split_output = tbl["split_output"].value_or(false);
         config.instructions_per_file = tbl["instructions_per_file"].value_or(20000);
+        config.count_instructions = tbl["count_instructions"].value_or(true);
+        config.lean_entry_switch = tbl["lean_entry_switch"].value_or(false);
+        config.gamecube = tbl["system"]["platform"].value_or(std::string()) == "GameCube";
 
         if (auto hooks = tbl["hle_hooks"].as_table()) {
             for (const auto& [key, val] : *hooks) {

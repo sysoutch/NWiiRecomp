@@ -2,6 +2,7 @@
 #include "analyzer/analyzer.h"
 #include "recompiler/symbols.h"
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,21 @@ struct RecompilerConfig {
 
     bool split_output = false;
     int instructions_per_file = 20000;
+    // Emit ++ctx.inst_count per guest instruction. That counter is the
+    // timebase unless the runtime uses the wall clock ([hle] wall_timebase);
+    // with the wall clock it is only statistics, and the per-instruction
+    // memory increment costs real speed -- then once per function suffices.
+    bool count_instructions = true;
+    // [system] platform = "GameCube": Wii-only HLE signatures are ignored.
+    bool gamecube = false;
+    // Each function's entry switch (switch (ctx.pc) { case ...: goto ...; })
+    // lists only real re-entry points -- the start, call return addresses,
+    // loop back-edges (interrupt polls), jump-table targets, branch targets
+    // from other functions and any address the function stores into ctx.pc
+    // -- instead of every instruction. Every case is a join point the
+    // optimiser cannot see through; with all of them, guest values could not
+    // stay in host registers. Other addresses fall to interpret_step.
+    bool lean_entry_switch = false;
 
     
 
@@ -45,6 +61,12 @@ private:
     const analyzer::Analyzer& analyzer_;
     const SymbolTable* symbols_;
     RecompilerConfig config_;
+    // Branch targets that leave their own function (lean_entry_switch).
+    std::set<uint32_t> extern_targets_;
+    bool extern_targets_ready_ = false;
+    // Address the dispatcher maps to the function being emitted (its key in
+    // the analyzer's map). Can differ from func.start_address.
+    uint32_t cur_entry_ = 0;
 };
 
 } 

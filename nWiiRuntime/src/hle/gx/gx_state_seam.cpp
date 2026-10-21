@@ -10,6 +10,12 @@
 #include "runtime/cpu_context.h"
 #include "runtime/gx_state.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+
 using nwii::runtime::CPUContext;
 
 namespace {
@@ -32,6 +38,12 @@ void RMWWrite(uint8_t kind, uint8_t reg, uint32_t mask, uint32_t val) {
 }
 
 } // namespace
+
+namespace nwii::runtime {
+uint64_t GX_WaitDrawDoneParsed(uint64_t target, CPUContext &ctx); // gx.cpp
+void GX_WaitRenderBacklog(uint64_t max_backlog, CPUContext &ctx);  // gx.cpp
+void vi_request_retrace(CPUContext &ctx);                          // ios.cpp
+}
 
 extern "C" {
 
@@ -71,6 +83,75 @@ void GXSetZMode(CPUContext &ctx) {
   const uint32_t v =
       (ctx.gpr[3] & 1) | ((ctx.gpr[4] & 7) << 1) | ((ctx.gpr[5] & 1) << 4);
   BPWrite(0x40, v);
+}
+
+// void GXDrawDone(void) -- opt-in via [hle_hooks]. The SDK version sets the
+// draw-done token (BP 0x45 = 2) and then sleeps until the PE finish
+// interrupt, which here only fires once the host thread has parsed that far
+// in the FIFO: CPU frame time + host parse latency + render time ran back to
+// back, holding Spyro at ~25 fps. The real GPU works in parallel with the
+// CPU; this lets the CPU build the next frame while the host renders this
+// one. The finish interrupt still arrives later (and runs the game's
+// draw-done callback, if any).
+//
+// Not waiting at all let the host fall several frames behind, and the parser
+// reads guest RAM (LOAD_INDX matrices, indexed vertex arrays) that the game
+// had already rewritten for later frames: broken bits of objects for single
+// frames. So the CPU waits until the host has parsed the token from
+// NWII_DRAWDONE_LAG frames ago (default 1 = one frame of overlap; 0 = full
+// sync like the SDK; -1 = never wait, the old behaviour).
+void GXDrawDone(CPUContext &ctx) {
+  static const int lag = [] {
+    const char *e = std::getenv("NWII_DRAWDONE_LAG");
+    return e ? std::atoi(e) : 1;
+  }();
+  static uint64_t issued = 0;
+  // NWII_FRAMEHIST=1: histogram of the game's frame intervals (GXDrawDone to
+  // GXDrawDone, 2 ms buckets) every 5 s -- 16.7 vs 33.3 ms shows missed
+  // VI retraces.
+  static const bool hist = std::getenv("NWII_FRAMEHIST") != nullptr;
+  // Wait at the end of the previous call: it falls inside this interval.
+  static uint64_t s_last_wait_us = 0;
+  if (hist) {
+    using clk = std::chrono::steady_clock;
+    static clk::time_point last = clk::now(), report = clk::now();
+    static uint32_t buckets[24] = {};
+    const auto now = clk::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    ++buckets[std::min(23, (int)(ms / 2.0))];
+    static int slow_logged = 0;
+    if (ms > 20.0 && slow_logged < 60) {
+      ++slow_logged;
+      std::printf("[SLOWFRAME] %.1f ms (draw-done wait in it %.1f ms)\n", ms,
+                  s_last_wait_us / 1000.0);
+    }
+    if (now - report >= std::chrono::seconds(5)) {
+      report = now;
+      std::printf("[FRAMEHIST]");
+      for (int i = 0; i < 24; ++i)
+        if (buckets[i]) std::printf(" %d-%dms:%u", i * 2, i * 2 + 2, buckets[i]);
+      std::printf("\n");
+      std::fflush(stdout);
+      std::fill(std::begin(buckets), std::end(buckets), 0u);
+    }
+  }
+  BPWrite(0x45, 0x000002);
+  ++issued;
+  uint64_t waited = 0;
+  if (lag >= 0 && issued > (uint64_t)lag)
+    waited = nwii::runtime::GX_WaitDrawDoneParsed(issued - lag, ctx);
+  if (hist) s_last_wait_us = waited;
+  // Keep the game at most NWII_RENDER_BACKLOG drawn frames (default 1) ahead
+  // of the render thread instead of letting the renderer drop frames.
+  // -1 = no back-pressure (frames are dropped when rendering falls behind).
+  static const int backlog = [] {
+    const char *e = std::getenv("NWII_RENDER_BACKLOG");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (backlog >= 0) nwii::runtime::GX_WaitRenderBacklog((uint64_t)backlog, ctx);
+  // End of a game frame: the game's VIFlush + VIWaitForRetrace follow.
+  nwii::runtime::vi_request_retrace(ctx);
 }
 
 // void GXSetZCompLoc(GXBool before_tex) -- BP 0x43 bit 6.

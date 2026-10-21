@@ -120,6 +120,8 @@ struct GXState {
   // 3 unused, colour as packed RGBA, cosatt[3], distatt[3], pos[3], dir[3]).
   float normalMatrices[96];
   float lights[8][16];
+  // XF 0x0500: dual-texgen post-transform matrices (64 rows of 4).
+  float postMatrices[256];
 
   
   
@@ -145,7 +147,9 @@ struct GXState {
       add_u32(bp[0xF3]); 
       for (int i = 0xC0; i <= 0xDF; ++i) add_u32(bp[i]); 
       for (int i = 0x28; i <= 0x2F; ++i) add_u32(bp[i]); 
-      for (int i = 0xE9; i <= 0xEE; ++i) add_u32(bp[i]); 
+      for (int i = 0xE9; i <= 0xEE; ++i) add_u32(bp[i]);
+      // KSEL: swap tables and konst selects are baked into the shader.
+      for (int i = 0xF6; i <= 0xFD; ++i) add_u32(bp[i]);
 
       for (int i = 0; i < 8; ++i) {
           add_u8(texStages[i].format);

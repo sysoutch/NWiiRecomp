@@ -5,12 +5,49 @@
 #include <csetjmp>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <iostream>
 #include <vector>
 #include <mutex>
 #include <atomic>
 #include <queue>
 #include <stack>
+
+// Cheap monotonic cycle counter for the interrupt-poll gate (x86 TSC). Other
+// hosts return 0, which makes the gate always open (old behaviour).
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+static inline uint64_t nwii_cycles() { return __rdtsc(); }
+#else
+static inline uint64_t nwii_cycles() { return 0; }
+#endif
+
+namespace nwii::runtime {
+extern bool g_wall_timebase; // defined in config.cpp
+// NWII_VERBOSE=1: developer chatter (dispatcher/heartbeat/interrupt traces,
+// every unhandled MMIO access). Off by default -- console output is slow and
+// the flood made the game crawl with a visible console window.
+extern bool g_verbose;
+
+// fctiw/fctiwz: saturate like Gekko (NaN and too-negative -> INT_MIN, too
+// positive -> INT_MAX). A plain cast is UB and x86 gives INT_MIN for both
+// overflow directions.
+inline uint32_t ppc_cvt_s32(double v) {
+  if (std::isnan(v) || v <= -2147483648.0) return 0x80000000u;
+  if (v >= 2147483647.0) return 0x7FFFFFFFu;
+  return (uint32_t)(int32_t)v;
+}
+// stfiwx stores an FPR's raw low word (fctiw* results live there as bits).
+inline uint32_t fpr_low_word(double v) {
+  uint64_t bits;
+  std::memcpy(&bits, &v, 8);
+  return (uint32_t)bits;
+}
+}
 
 namespace nwii {
 namespace runtime {
@@ -28,7 +65,7 @@ void GX_WGPIPE_Write8(uint8_t val);
 void GX_WGPIPE_Write16(uint16_t val);
 void GX_WGPIPE_Write32(uint32_t val);
 void GX_DL_Snapshot(uint32_t addr, uint32_t size);
-bool GX_DL_Fetch(uint32_t addr, uint32_t size, std::vector<uint8_t>& out);
+std::shared_ptr<const std::vector<uint8_t>> GX_DL_Fetch(uint32_t addr, uint32_t size);
 void GX_WGPIPE_WriteF32(float val);
 void GX_WGPIPE_WriteF64(double val);
 
@@ -53,6 +90,35 @@ struct CallbackInfo {
 
 void watch_hit(uint32_t addr, uint32_t value, int width);
 extern uint32_t g_watch_addr;
+
+// Generated function definitions take CPUContext& NWII_RESTRICT ctx (see
+// the recompiler's emit_function). -DNWII_NO_RESTRICT turns it off.
+#if defined(NWII_NO_RESTRICT)
+#define NWII_RESTRICT
+#elif defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+#define NWII_RESTRICT __restrict
+#else
+#define NWII_RESTRICT
+#endif
+
+#if defined(_MSC_VER)
+#include <stdlib.h>
+#define NWII_FORCEINLINE __forceinline
+#define NWII_NOINLINE __declspec(noinline)
+static inline uint16_t nwii_bswap16(uint16_t v) { return _byteswap_ushort(v); }
+static inline uint32_t nwii_bswap32(uint32_t v) { return _byteswap_ulong(v); }
+static inline uint64_t nwii_bswap64(uint64_t v) { return _byteswap_uint64(v); }
+#else
+#define NWII_FORCEINLINE inline __attribute__((always_inline))
+#define NWII_NOINLINE __attribute__((noinline))
+static inline uint16_t nwii_bswap16(uint16_t v) { return __builtin_bswap16(v); }
+static inline uint32_t nwii_bswap32(uint32_t v) { return __builtin_bswap32(v); }
+static inline uint64_t nwii_bswap64(uint64_t v) { return __builtin_bswap64(v); }
+#endif
+
+// Cycles between full interrupt checks at loop back-edges (NWII_POLL_US,
+// default 20 us; 0 = every 16th back-edge as before). Calibrated at startup.
+extern uint64_t g_poll_cycles;
 
 // Strict Dolphin-accurate MMU
 struct MMU {
@@ -79,7 +145,7 @@ struct MMU {
              (paddr >= 0x0D000000 && paddr < 0x0D010000);
   }
 
-  uint8_t read8(uint32_t addr) {
+  NWII_NOINLINE uint8_t read8_slow(uint32_t addr) {
     uint32_t paddr = addr & 0x3FFFFFFF;
 
     if (is_hw_reg(paddr)) {
@@ -94,7 +160,7 @@ struct MMU {
 
   void custom_watch(uint32_t, uint32_t, int) {}
 
-  void write8(uint32_t addr, uint8_t value) {
+  NWII_NOINLINE void write8_slow(uint32_t addr, uint8_t value) {
     custom_watch(addr, value, 8);
     uint32_t paddr = addr & 0x3FFFFFFF;
     if (g_watch_addr && (paddr & ~3u) == (g_watch_addr & 0x3FFFFFFC))
@@ -110,7 +176,7 @@ struct MMU {
     if (ptr) *ptr = value;
   }
 
-  uint16_t read16(uint32_t addr) {
+  NWII_NOINLINE uint16_t read16_slow(uint32_t addr) {
     uint32_t paddr = addr & 0x3FFFFFFF;
 
     if (is_hw_reg(paddr)) return HW_Reg_Read16(paddr);
@@ -120,7 +186,7 @@ struct MMU {
     return 0;
   }
 
-  void write16(uint32_t addr, uint16_t value) {
+  NWII_NOINLINE void write16_slow(uint32_t addr, uint16_t value) {
     custom_watch(addr, value, 16);
     uint32_t paddr = addr & 0x3FFFFFFF;
     if (g_watch_addr && (paddr & ~3u) == (g_watch_addr & 0x3FFFFFFC))
@@ -133,7 +199,7 @@ struct MMU {
     if (ptr) { ptr[0] = value >> 8; ptr[1] = value & 0xFF; }
   }
 
-  uint32_t read32(uint32_t addr) {
+  NWII_NOINLINE uint32_t read32_slow(uint32_t addr) {
     uint32_t paddr = addr & 0x3FFFFFFF;
     if (paddr == 0x0000000C) return 0; 
 
@@ -146,7 +212,7 @@ struct MMU {
     return val;
   }
 
-  void write32(uint32_t addr, uint32_t value) {
+  NWII_NOINLINE void write32_slow(uint32_t addr, uint32_t value) {
     custom_watch(addr, value, 32);
     uint32_t paddr = addr & 0x3FFFFFFF;
     if (paddr == 0x0000000C) return; 
@@ -160,8 +226,8 @@ struct MMU {
     if (ptr) { ptr[0] = value >> 24; ptr[1] = (value >> 16) & 0xFF; ptr[2] = (value >> 8) & 0xFF; ptr[3] = value & 0xFF; }
   }
 
-  float read_f32(uint32_t addr) { uint32_t val = read32(addr); float f; std::memcpy(&f, &val, 4); return f; }
-  void write_f32(uint32_t addr, float value) {
+  NWII_FORCEINLINE float read_f32(uint32_t addr) { uint32_t val = read32(addr); float f; std::memcpy(&f, &val, 4); return f; }
+  NWII_NOINLINE void write_f32_slow(uint32_t addr, float value) {
     uint32_t paddr = addr & 0x3FFFFFFF;
     
     uint32_t v;
@@ -177,7 +243,7 @@ struct MMU {
     }
   }
 
-  void write_f64(uint32_t addr, double value) {
+  NWII_NOINLINE void write_f64_slow(uint32_t addr, double value) {
     uint32_t paddr = addr & 0x3FFFFFFF;
     
     uint64_t v;
@@ -194,13 +260,13 @@ struct MMU {
     }
   }
 
-  uint64_t read64(uint32_t addr) {
+  NWII_NOINLINE uint64_t read64_slow(uint32_t addr) {
     uint8_t *ptr = get_ptr(addr);
     if (!ptr) return 0;
     return ((uint64_t)ptr[0] << 56) | ((uint64_t)ptr[1] << 48) | ((uint64_t)ptr[2] << 40) | ((uint64_t)ptr[3] << 32) |
            ((uint64_t)ptr[4] << 24) | ((uint64_t)ptr[5] << 16) | ((uint64_t)ptr[6] << 8) | ptr[7];
   }
-  void write64(uint32_t addr, uint64_t value) {
+  NWII_NOINLINE void write64_slow(uint32_t addr, uint64_t value) {
     uint32_t paddr = addr & 0x3FFFFFFF;
     if (g_watch_addr && (paddr & ~7u) == (g_watch_addr & 0x3FFFFFF8))
       watch_hit(addr, value >> 32, 64);
@@ -210,7 +276,7 @@ struct MMU {
     ptr[0] = value >> 56; ptr[1] = (value >> 48) & 0xFF; ptr[2] = (value >> 40) & 0xFF; ptr[3] = (value >> 32) & 0xFF;
     ptr[4] = (value >> 24) & 0xFF; ptr[5] = (value >> 16) & 0xFF; ptr[6] = (value >> 8) & 0xFF; ptr[7] = value & 0xFF;
   }
-  double read_f64(uint32_t addr) { 
+  NWII_NOINLINE double read_f64_slow(uint32_t addr) { 
       uint8_t *ptr = get_ptr(addr);
       if (ptr) {
           uint64_t val = ((uint64_t)ptr[0] << 56) | ((uint64_t)ptr[1] << 48) | ((uint64_t)ptr[2] << 40) | ((uint64_t)ptr[3] << 32) |
@@ -220,6 +286,69 @@ struct MMU {
       return 0.0;
   }
 
+
+  // Fast paths: plain MEM1 RAM (past the low vectors, which keep their
+  // special cases) is a bounds check plus a byte-swapped load/store; anything
+  // else -- hardware registers, the write-gather pipe, MEM2, watchpoints --
+  // takes the out-of-line *_slow path. Every guest load/store goes through
+  // here, and the out-of-line versions were ~25% of the CPU thread.
+  static constexpr uint32_t kRamSize = 24u * 1024 * 1024;
+  static NWII_FORCEINLINE bool fast_ram(uint32_t paddr, uint32_t len) {
+    return paddr - 0x100u < kRamSize - 0x100u - (len - 1);
+  }
+  NWII_FORCEINLINE uint8_t read8(uint32_t addr) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (fast_ram(p, 1)) [[likely]] return mem1.data()[p];
+    return read8_slow(addr);
+  }
+  NWII_FORCEINLINE uint16_t read16(uint32_t addr) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (fast_ram(p, 2)) [[likely]] { uint16_t v; std::memcpy(&v, mem1.data() + p, 2); return nwii_bswap16(v); }
+    return read16_slow(addr);
+  }
+  NWII_FORCEINLINE uint32_t read32(uint32_t addr) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (fast_ram(p, 4)) [[likely]] { uint32_t v; std::memcpy(&v, mem1.data() + p, 4); return nwii_bswap32(v); }
+    return read32_slow(addr);
+  }
+  NWII_FORCEINLINE uint64_t read64(uint32_t addr) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (fast_ram(p, 8)) [[likely]] { uint64_t v; std::memcpy(&v, mem1.data() + p, 8); return nwii_bswap64(v); }
+    return read64_slow(addr);
+  }
+  NWII_FORCEINLINE double read_f64(uint32_t addr) {
+    const uint64_t v = read64(addr); double f; std::memcpy(&f, &v, 8); return f;
+  }
+  NWII_FORCEINLINE void write8(uint32_t addr, uint8_t value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 1)) [[likely]] { mem1.data()[p] = value; return; }
+    write8_slow(addr, value);
+  }
+  NWII_FORCEINLINE void write16(uint32_t addr, uint16_t value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 2)) [[likely]] { const uint16_t v = nwii_bswap16(value); std::memcpy(mem1.data() + p, &v, 2); return; }
+    write16_slow(addr, value);
+  }
+  NWII_FORCEINLINE void write32(uint32_t addr, uint32_t value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 4)) [[likely]] { const uint32_t v = nwii_bswap32(value); std::memcpy(mem1.data() + p, &v, 4); return; }
+    write32_slow(addr, value);
+  }
+  NWII_FORCEINLINE void write64(uint32_t addr, uint64_t value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 8)) [[likely]] { const uint64_t v = nwii_bswap64(value); std::memcpy(mem1.data() + p, &v, 8); return; }
+    write64_slow(addr, value);
+  }
+  NWII_FORCEINLINE void write_f32(uint32_t addr, float value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 4)) [[likely]] { uint32_t v; std::memcpy(&v, &value, 4); v = nwii_bswap32(v); std::memcpy(mem1.data() + p, &v, 4); return; }
+    write_f32_slow(addr, value);
+  }
+  NWII_FORCEINLINE void write_f64(uint32_t addr, double value) {
+    const uint32_t p = addr & 0x3FFFFFFF;
+    if (!g_watch_addr && fast_ram(p, 8)) [[likely]] { uint64_t v; std::memcpy(&v, &value, 8); v = nwii_bswap64(v); std::memcpy(mem1.data() + p, &v, 8); return; }
+    write_f64_slow(addr, value);
+  }
 };
 
 struct CPUContext {
@@ -275,6 +404,8 @@ struct CPUContext {
   std::queue<CallbackInfo> pending_callbacks;
   
   std::atomic<int> pending_cb_count{0};
+  uint32_t poll_tick = 0; // poll_callbacks() throttle
+  uint64_t poll_deadline = 0; // nwii_cycles() value of the next full check
   jmp_buf exception_jmp_buf;
 
   uint32_t reservation_addr = 0xFFFFFFFF;
@@ -307,8 +438,7 @@ struct CPUContext {
   // 122 DVD reads with the virtual clock vs 52 with the wall clock. Switch the
   // default once the drain is fast enough to keep up.
   uint64_t read_timebase() const {
-    static const bool wall = std::getenv("NWII_WALLTB") != nullptr;
-    if (wall) {
+    if (g_wall_timebase) {
       uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - tb_start)
                         .count();
@@ -356,11 +486,31 @@ struct CPUContext {
     pending_cb_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void psq_load(uint32_t frD, uint32_t addr, uint32_t W, uint32_t I) {
+  // GQR type 0 (plain floats) is what games use almost exclusively (Spyro:
+  // every psq uses GQR0 = 0); keep it inline, quantised forms out of line.
+  NWII_FORCEINLINE void psq_load(uint32_t frD, uint32_t addr, uint32_t W, uint32_t I) {
+    if (((gqr[I] >> 16) & 7) == 0) [[likely]] {
+      fpr[frD] = mmu.read_f32(addr);
+      ps1[frD] = W ? 1.0 : (double)mmu.read_f32(addr + 4);
+      return;
+    }
+    psq_load_slow(frD, addr, W, I);
+  }
+  NWII_FORCEINLINE void psq_store(uint32_t frS, uint32_t addr, uint32_t W, uint32_t I) {
+    if ((gqr[I] & 7) == 0) [[likely]] {
+      mmu.write_f32(addr, (float)fpr[frS]);
+      if (!W) mmu.write_f32(addr + 4, (float)ps1[frS]);
+      return;
+    }
+    psq_store_slow(frS, addr, W, I);
+  }
+  NWII_NOINLINE void psq_load_slow(uint32_t frD, uint32_t addr, uint32_t W, uint32_t I) {
     uint32_t gqr_val = gqr[I];
     uint32_t ld_type = (gqr_val >> 16) & 0x7;
-    uint32_t ld_scale = (gqr_val >> 24) & 0x3F;
-    float scale = std::pow(2.0f, -((int)ld_scale));
+    // Scale is a signed 6-bit exponent: value = raw * 2^-scale.
+    int ld_scale = (int)((gqr_val >> 24) & 0x3F);
+    if (ld_scale & 0x20) ld_scale -= 64;
+    float scale = std::ldexp(1.0f, -ld_scale);
 
     auto load_element = [&](uint32_t a) -> double {
       switch (ld_type) {
@@ -390,11 +540,19 @@ struct CPUContext {
     }
   }
 
-  void psq_store(uint32_t frS, uint32_t addr, uint32_t W, uint32_t I) {
+  NWII_NOINLINE void psq_store_slow(uint32_t frS, uint32_t addr, uint32_t W, uint32_t I) {
     uint32_t gqr_val = gqr[I];
     uint32_t st_type = gqr_val & 0x7;
-    uint32_t st_scale = (gqr_val >> 8) & 0x3F;
-    float scale = std::pow(2.0f, (int)st_scale);
+    int st_scale = (int)((gqr_val >> 8) & 0x3F);
+    if (st_scale & 0x20) st_scale -= 64;
+    float scale = std::ldexp(1.0f, st_scale);
+    // Quantized stores saturate to the integer type's range (truncating).
+    auto q = [&](double v, double lo, double hi) -> int32_t {
+      v *= scale;
+      if (!(v > lo)) return (int32_t)lo;  // also NaN
+      if (v > hi) return (int32_t)hi;
+      return (int32_t)v;
+    };
 
     auto store_element = [&](uint32_t a, double val) {
       switch (st_type) {
@@ -402,16 +560,16 @@ struct CPUContext {
         mmu.write_f32(a, (float)val);
         break;
       case 4:
-        mmu.write8(a, (uint8_t)(val * scale));
+        mmu.write8(a, (uint8_t)q(val, 0, 255));
         break;
       case 5:
-        mmu.write16(a, (uint16_t)(val * scale));
+        mmu.write16(a, (uint16_t)q(val, 0, 65535));
         break;
       case 6:
-        mmu.write8(a, (int8_t)(val * scale));
+        mmu.write8(a, (uint8_t)(int8_t)q(val, -128, 127));
         break;
       case 7:
-        mmu.write16(a, (int16_t)(val * scale));
+        mmu.write16(a, (uint16_t)(int16_t)q(val, -32768, 32767));
         break;
       }
     };
@@ -426,36 +584,36 @@ struct CPUContext {
   }
 
   inline void ps_add(uint32_t D, uint32_t A, uint32_t B) {
-    fpr[D] = fpr[A] + fpr[B];
-    ps1[D] = ps1[A] + ps1[B];
+    fpr[D] = (float)(fpr[A] + fpr[B]);
+    ps1[D] = (float)(ps1[A] + ps1[B]);
   }
   inline void ps_sub(uint32_t D, uint32_t A, uint32_t B) {
-    fpr[D] = fpr[A] - fpr[B];
-    ps1[D] = ps1[A] - ps1[B];
+    fpr[D] = (float)(fpr[A] - fpr[B]);
+    ps1[D] = (float)(ps1[A] - ps1[B]);
   }
   inline void ps_mul(uint32_t D, uint32_t A, uint32_t C) {
-    fpr[D] = fpr[A] * fpr[C];
-    ps1[D] = ps1[A] * ps1[C];
+    fpr[D] = (float)(fpr[A] * fpr[C]);
+    ps1[D] = (float)(ps1[A] * ps1[C]);
   }
   inline void ps_madd(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = std::fma(fpr[A], fpr[C], fpr[B]);
-    ps1[D] = std::fma(ps1[A], ps1[C], ps1[B]);
+    fpr[D] = (float)(std::fma(fpr[A], fpr[C], fpr[B]));
+    ps1[D] = (float)(std::fma(ps1[A], ps1[C], ps1[B]));
   }
   inline void ps_msub(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = std::fma(fpr[A], fpr[C], -fpr[B]);
-    ps1[D] = std::fma(ps1[A], ps1[C], -ps1[B]);
+    fpr[D] = (float)(std::fma(fpr[A], fpr[C], -fpr[B]));
+    ps1[D] = (float)(std::fma(ps1[A], ps1[C], -ps1[B]));
   }
   inline void ps_nmadd(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = -std::fma(fpr[A], fpr[C], fpr[B]);
-    ps1[D] = -std::fma(ps1[A], ps1[C], ps1[B]);
+    fpr[D] = (float)(-std::fma(fpr[A], fpr[C], fpr[B]));
+    ps1[D] = (float)(-std::fma(ps1[A], ps1[C], ps1[B]));
   }
   inline void ps_nmsub(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = -std::fma(fpr[A], fpr[C], -fpr[B]);
-    ps1[D] = -std::fma(ps1[A], ps1[C], -ps1[B]);
+    fpr[D] = (float)(-std::fma(fpr[A], fpr[C], -fpr[B]));
+    ps1[D] = (float)(-std::fma(ps1[A], ps1[C], -ps1[B]));
   }
   inline void ps_div(uint32_t D, uint32_t A, uint32_t B) {
-    fpr[D] = fpr[A] / fpr[B];
-    ps1[D] = ps1[A] / ps1[B];
+    fpr[D] = (float)(fpr[A] / fpr[B]);
+    ps1[D] = (float)(ps1[A] / ps1[B]);
   }
   inline void ps_sum0(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
 
@@ -473,20 +631,20 @@ struct CPUContext {
     ps1[D] = (float)t;
   }
   inline void ps_muls0(uint32_t D, uint32_t A, uint32_t C) {
-    fpr[D] = fpr[A] * fpr[C];
-    ps1[D] = ps1[A] * fpr[C];
+    fpr[D] = (float)(fpr[A] * fpr[C]);
+    ps1[D] = (float)(ps1[A] * fpr[C]);
   }
   inline void ps_muls1(uint32_t D, uint32_t A, uint32_t C) {
-    fpr[D] = fpr[A] * ps1[C];
-    ps1[D] = ps1[A] * ps1[C];
+    fpr[D] = (float)(fpr[A] * ps1[C]);
+    ps1[D] = (float)(ps1[A] * ps1[C]);
   }
   inline void ps_madds0(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = std::fma(fpr[A], fpr[C], fpr[B]);
-    ps1[D] = std::fma(ps1[A], fpr[C], ps1[B]);
+    fpr[D] = (float)(std::fma(fpr[A], fpr[C], fpr[B]));
+    ps1[D] = (float)(std::fma(ps1[A], fpr[C], ps1[B]));
   }
   inline void ps_madds1(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
-    fpr[D] = std::fma(fpr[A], ps1[C], fpr[B]);
-    ps1[D] = std::fma(ps1[A], ps1[C], ps1[B]);
+    fpr[D] = (float)(std::fma(fpr[A], ps1[C], fpr[B]));
+    ps1[D] = (float)(std::fma(ps1[A], ps1[C], ps1[B]));
   }
   inline void ps_sel(uint32_t D, uint32_t A, uint32_t C, uint32_t B) {
     fpr[D] = (fpr[A] >= 0.0) ? fpr[C] : fpr[B];
@@ -556,6 +714,25 @@ struct CPUContext {
   }
 };
 
+// Loop back-edges in compiled code poll for interrupts/callbacks. The full
+// check (wall clock, scheduler, decrementer, device ticks) costs far more
+// than a loop iteration, so it runs only every 16th back-edge AND once
+// g_poll_cycles have passed -- or at once when a callback is queued. Calling
+// it on every 16th back-edge alone was ~7% of the CPU thread (a tight loop
+// iterates many times per microsecond); interrupt latency stays ~20 us,
+// small next to the 1-8 ms hardware timers involved.
+NWII_FORCEINLINE bool poll_callbacks(CPUContext &c) {
+  if ((++c.poll_tick & 15) != 0 &&
+      c.pending_cb_count.load(std::memory_order_relaxed) == 0) [[likely]]
+    return false;
+  if (c.pending_cb_count.load(std::memory_order_relaxed) == 0) {
+    const uint64_t now = nwii_cycles();
+    if (now < c.poll_deadline) return false;
+    c.poll_deadline = now + nwii::runtime::g_poll_cycles;
+  }
+  return process_pending_callbacks(c);
+}
+
 void hle_set_ipc_arm_msg(uint32_t req_addr);
 void micro_interpret(CPUContext& ctx, uint32_t opcode, uint32_t pc);
 
@@ -565,6 +742,21 @@ void add_recompiled_range(uint32_t start, uint32_t end);
 bool in_recompiled_code(uint32_t pc);
 
 extern bool g_trace_calls;
+// Interpreter mode (NWII_CTRL "interp on"): every recompiled function hands
+// execution to interp_run() instead of its compiled body. For telling
+// recompilation bugs from runtime/HLE ones.
+extern volatile bool g_interp_mode;
+// Only functions below this address are interpreted; the rest (the SDK:
+// OS threads, DVD, GX...) keep running compiled, and interp_run calls them.
+extern volatile uint32_t g_interp_limit;
+void register_compiled_func(uint32_t addr, void (*fn)(CPUContext&));
+// Call the compiled function at ctx.pc in place (indirect calls); false when
+// ctx.pc is not a known function entry.
+bool call_indirect(CPUContext& ctx);
+void interp_run(CPUContext& ctx);
+// Guest addresses bound to native handlers ([hle_hooks], HLE seams); the
+// interpreter calls these instead of interpreting the original SDK code.
+void register_native_func(uint32_t addr, void (*fn)(CPUContext&));
 void trace_call(uint32_t func_addr, CPUContext& ctx);
 
 

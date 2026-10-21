@@ -52,6 +52,7 @@ void register_all_hw(MMIODispatcher &dispatcher) {
   NWII_HW_BLOCK(dsp);
   NWII_HW_BLOCK(ai);
   NWII_HW_BLOCK(di);
+  NWII_HW_BLOCK(exi);
   NWII_HW_BLOCK(ipc);
 #undef NWII_HW_BLOCK
 }

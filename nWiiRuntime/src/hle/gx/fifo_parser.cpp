@@ -29,6 +29,8 @@ extern GXState g_state;
 // the renderer applies later loads over the same slot.
 static float g_parse_posmtx[256] = {0};
 static float g_parse_nrmmtx[96] = {0};
+// XF 0x100E/0x100F as of the current parse position (see the 0x10 handler).
+static uint32_t s_parse_chan_ctrl[2] = {0, 0};
 
 static void ParseApplyMatrixWrite(uint32_t xf_addr, const std::vector<float>& payload) {
     for (size_t i = 0; i < payload.size(); ++i) {
@@ -60,6 +62,12 @@ namespace {
 
     void ApplyBPRegisterImpl(uint8_t reg, uint32_t val);
 
+    // The parser's own register file (CP/VAT/array state, BP and CP shadows
+    // for the 0x78 read-modify-write merges). The renderer's g_state is
+    // written only by ApplyBPRegister & co. in stream order at render time,
+    // so parsing can run on its own thread, ahead of rendering.
+    GXState g_pstate;
+
     void ParseBP(uint8_t reg, uint32_t val) {
 
         
@@ -72,16 +80,23 @@ namespace {
             nwii::runtime::hw::pe_signal_token(val & 0xFFFF, true);
         }
 
-        
-        // from the wrong state is cached for the rest of the run. Dolphin's
-
-        // time. NWII_NOSEED=1 takes the Dolphin behaviour.
-        static const bool no_seed = std::getenv("NWII_NOSEED") != nullptr;
-        if (!no_seed)
-            g_state.bp[reg] = val;
+        // Parser shadow only. Seeding the renderer's g_state.bp here was a
+        // look-ahead over whatever had been pushed so far: GetShaderHash()
+        // reads bp[], so shaders depended on thread timing. Dolphin's
+        // equivalent pass (LoadBPRegPreprocess) never touches bpmem either.
+        g_pstate.bp[reg] = val;
     }
 
     void ApplyBPRegisterImpl(uint8_t reg, uint32_t val) {
+        // NWII_BPLOG=<hex reg>: print the first 400 applied writes to it.
+        static const int bplog = [] {
+            const char *e = std::getenv("NWII_BPLOG");
+            return e ? (int)std::strtoul(e, nullptr, 16) : -1;
+        }();
+        if (reg == bplog || (bplog >= 0 && reg == 0xFE)) {
+            static int n = 0;
+            if (n++ < 400) std::printf("[BPLOG] %02X = %06X\n", reg, val);
+        }
         g_state.bp[reg] = val;
         if (reg == 0x00) {
             g_state.numTexGens = (val & 0xF);
@@ -226,7 +241,7 @@ namespace {
 
     
     void ParseCP(uint8_t reg, uint32_t val) {
-        g_state.cp[reg] = val;
+        g_pstate.cp[reg] = val;
         if (g_skindbg && (reg == 0x50 || reg == 0x30 || reg == 0x60)) {
             static uint32_t last50=0xFFFFFFFF, last30=0xFFFFFFFF, last60=0xFFFFFFFF;
             uint32_t* lp = reg==0x50?&last50:(reg==0x30?&last30:&last60);
@@ -237,36 +252,36 @@ namespace {
             }
         }
         if (reg >= 0xA0 && reg <= 0xAF) {
-            g_state.arrayBase[reg - 0xA0] = val & 0x3FFFFFFF;
+            g_pstate.arrayBase[reg - 0xA0] = val & 0x3FFFFFFF;
         } else if (reg >= 0xB0 && reg <= 0xBF) {
-            g_state.arrayStride[reg - 0xB0] = val & 0xFF;
+            g_pstate.arrayStride[reg - 0xB0] = val & 0xFF;
         } else if (reg == 0x30) {
             // Matrix index A: pos/normal (bits 0-5), tex0-3 (6-29).
-            g_state.defPosMtxIdx = val & 0x3F;
+            g_pstate.defPosMtxIdx = val & 0x3F;
             for (int t = 0; t < 4; t++)
-                g_state.defTexMtxIdx[t] = (val >> (6 + t * 6)) & 0x3F;
+                g_pstate.defTexMtxIdx[t] = (val >> (6 + t * 6)) & 0x3F;
             static const bool tmdbg = std::getenv("NWII_TEXMTXDBG") != nullptr;
             if (tmdbg) {
                 static uint32_t seen = 0;
-                for (int t = 0; t < 4; t++) seen |= (1u << g_state.defTexMtxIdx[t]);
+                for (int t = 0; t < 4; t++) seen |= (1u << g_pstate.defTexMtxIdx[t]);
                 static auto t0 = std::chrono::steady_clock::now();
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 2) {
                     t0 = now;
                     printf("[TEXMTX30] tex0-3 indices:");
                     for (int i = 0; i < 32; i++) if (seen & (1u << i)) printf(" %d", i);
-                    printf(" numTexGens=%d\n", g_state.numTexGens);
+                    printf(" numTexGens=%d\n", g_pstate.numTexGens);
                     seen = 0;
                 }
             }
         } else if (reg == 0x40) {
             // Matrix index B: tex4-7.
             for (int t = 0; t < 4; t++)
-                g_state.defTexMtxIdx[4 + t] = (val >> (t * 6)) & 0x3F;
+                g_pstate.defTexMtxIdx[4 + t] = (val >> (t * 6)) & 0x3F;
             static const bool tmdbg = std::getenv("NWII_TEXMTXDBG") != nullptr;
             if (tmdbg) {
                 static uint32_t seen = 0;
-                for (int t = 0; t < 8; t++) seen |= (1u << g_state.defTexMtxIdx[t]);
+                for (int t = 0; t < 8; t++) seen |= (1u << g_pstate.defTexMtxIdx[t]);
                 static auto t0 = std::chrono::steady_clock::now();
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 2) {
@@ -282,62 +297,62 @@ namespace {
             
             
             for (int i = 0; i < 8; i++) {
-                g_state.vat[i].posMatIdx  = (val >> 0) & 1;
+                g_pstate.vat[i].posMatIdx  = (val >> 0) & 1;
                 for (int t = 0; t < 8; t++)
-                    g_state.vat[i].texMatIdx[t] = (val >> (1 + t)) & 1;
-                g_state.vat[i].posMask    = (VtxAttrMask)((val >> 9)  & 3);
-                g_state.vat[i].nrmMask    = (VtxAttrMask)((val >> 11) & 3);
-                g_state.vat[i].clrMask[0] = (VtxAttrMask)((val >> 13) & 3);
-                g_state.vat[i].clrMask[1] = (VtxAttrMask)((val >> 15) & 3);
-                g_state.vat[i].nrmIndex3  = ((val >> 31) & 1) != 0;
+                    g_pstate.vat[i].texMatIdx[t] = (val >> (1 + t)) & 1;
+                g_pstate.vat[i].posMask    = (VtxAttrMask)((val >> 9)  & 3);
+                g_pstate.vat[i].nrmMask    = (VtxAttrMask)((val >> 11) & 3);
+                g_pstate.vat[i].clrMask[0] = (VtxAttrMask)((val >> 13) & 3);
+                g_pstate.vat[i].clrMask[1] = (VtxAttrMask)((val >> 15) & 3);
+                g_pstate.vat[i].nrmIndex3  = ((val >> 31) & 1) != 0;
             }
         } else if (reg == 0x60) {
             
             for (int i = 0; i < 8; i++)
                 for (int t = 0; t < 8; t++)
-                    g_state.vat[i].texMask[t] = (VtxAttrMask)((val >> (t * 2)) & 3);
+                    g_pstate.vat[i].texMask[t] = (VtxAttrMask)((val >> (t * 2)) & 3);
         } else if (reg >= 0x70 && reg <= 0x77) {
             
             int i = reg - 0x70;
-            g_state.vat[i].posElements  = (val >> 0)  & 1;
-            g_state.vat[i].posType      = (VtxAttrType)((val >> 1) & 7);
-            g_state.vat[i].posShift     = (val >> 4)  & 0x1F;
-            g_state.vat[i].nrmElements  = (val >> 9)  & 1;
-            g_state.vat[i].nrmType      = (VtxAttrType)((val >> 10) & 7);
-            g_state.vat[i].clrElements[0] = (val >> 13) & 1;
-            g_state.vat[i].clrType[0]   = (VtxAttrType)((val >> 14) & 7);
-            g_state.vat[i].clrElements[1] = (val >> 17) & 1;
-            g_state.vat[i].clrType[1]   = (VtxAttrType)((val >> 18) & 7);
-            g_state.vat[i].texElements[0] = (val >> 21) & 1;
-            g_state.vat[i].texType[0]   = (VtxAttrType)((val >> 22) & 7);
-            g_state.vat[i].texShift[0]  = (val >> 25) & 0x1F;
+            g_pstate.vat[i].posElements  = (val >> 0)  & 1;
+            g_pstate.vat[i].posType      = (VtxAttrType)((val >> 1) & 7);
+            g_pstate.vat[i].posShift     = (val >> 4)  & 0x1F;
+            g_pstate.vat[i].nrmElements  = (val >> 9)  & 1;
+            g_pstate.vat[i].nrmType      = (VtxAttrType)((val >> 10) & 7);
+            g_pstate.vat[i].clrElements[0] = (val >> 13) & 1;
+            g_pstate.vat[i].clrType[0]   = (VtxAttrType)((val >> 14) & 7);
+            g_pstate.vat[i].clrElements[1] = (val >> 17) & 1;
+            g_pstate.vat[i].clrType[1]   = (VtxAttrType)((val >> 18) & 7);
+            g_pstate.vat[i].texElements[0] = (val >> 21) & 1;
+            g_pstate.vat[i].texType[0]   = (VtxAttrType)((val >> 22) & 7);
+            g_pstate.vat[i].texShift[0]  = (val >> 25) & 0x1F;
         } else if (reg >= 0x80 && reg <= 0x87) {
             
             int i = reg - 0x80;
-            g_state.vat[i].texElements[1] = (val >> 0)  & 1;
-            g_state.vat[i].texType[1]   = (VtxAttrType)((val >> 1) & 7);
-            g_state.vat[i].texShift[1]  = (val >> 4)  & 0x1F;
-            g_state.vat[i].texElements[2] = (val >> 9)  & 1;
-            g_state.vat[i].texType[2]   = (VtxAttrType)((val >> 10) & 7);
-            g_state.vat[i].texShift[2]  = (val >> 13) & 0x1F;
-            g_state.vat[i].texElements[3] = (val >> 18) & 1;
-            g_state.vat[i].texType[3]   = (VtxAttrType)((val >> 19) & 7);
-            g_state.vat[i].texShift[3]  = (val >> 22) & 0x1F;
-            g_state.vat[i].texElements[4] = (val >> 27) & 1;
-            g_state.vat[i].texType[4]   = (VtxAttrType)((val >> 28) & 7);
+            g_pstate.vat[i].texElements[1] = (val >> 0)  & 1;
+            g_pstate.vat[i].texType[1]   = (VtxAttrType)((val >> 1) & 7);
+            g_pstate.vat[i].texShift[1]  = (val >> 4)  & 0x1F;
+            g_pstate.vat[i].texElements[2] = (val >> 9)  & 1;
+            g_pstate.vat[i].texType[2]   = (VtxAttrType)((val >> 10) & 7);
+            g_pstate.vat[i].texShift[2]  = (val >> 13) & 0x1F;
+            g_pstate.vat[i].texElements[3] = (val >> 18) & 1;
+            g_pstate.vat[i].texType[3]   = (VtxAttrType)((val >> 19) & 7);
+            g_pstate.vat[i].texShift[3]  = (val >> 22) & 0x1F;
+            g_pstate.vat[i].texElements[4] = (val >> 27) & 1;
+            g_pstate.vat[i].texType[4]   = (VtxAttrType)((val >> 28) & 7);
         } else if (reg >= 0x90 && reg <= 0x97) {
             
             int i = reg - 0x90;
-            g_state.vat[i].texShift[4]  = (val >> 0)  & 0x1F;
-            g_state.vat[i].texElements[5] = (val >> 5)  & 1;
-            g_state.vat[i].texType[5]   = (VtxAttrType)((val >> 6) & 7);
-            g_state.vat[i].texShift[5]  = (val >> 9)  & 0x1F;
-            g_state.vat[i].texElements[6] = (val >> 14) & 1;
-            g_state.vat[i].texType[6]   = (VtxAttrType)((val >> 15) & 7);
-            g_state.vat[i].texShift[6]  = (val >> 18) & 0x1F;
-            g_state.vat[i].texElements[7] = (val >> 23) & 1;
-            g_state.vat[i].texType[7]   = (VtxAttrType)((val >> 24) & 7);
-            g_state.vat[i].texShift[7]  = (val >> 27) & 0x1F;
+            g_pstate.vat[i].texShift[4]  = (val >> 0)  & 0x1F;
+            g_pstate.vat[i].texElements[5] = (val >> 5)  & 1;
+            g_pstate.vat[i].texType[5]   = (VtxAttrType)((val >> 6) & 7);
+            g_pstate.vat[i].texShift[5]  = (val >> 9)  & 0x1F;
+            g_pstate.vat[i].texElements[6] = (val >> 14) & 1;
+            g_pstate.vat[i].texType[6]   = (VtxAttrType)((val >> 15) & 7);
+            g_pstate.vat[i].texShift[6]  = (val >> 18) & 0x1F;
+            g_pstate.vat[i].texElements[7] = (val >> 23) & 1;
+            g_pstate.vat[i].texType[7]   = (VtxAttrType)((val >> 24) & 7);
+            g_pstate.vat[i].texShift[7]  = (val >> 27) & 0x1F;
         }
     }
 
@@ -544,9 +559,9 @@ static void skin_report() {
 
 static uint64_t DLStateHash() {
     uint64_t h = 14695981039346656037ull;
-    for (int r = 0x30; r <= 0xBF; ++r) { h ^= g_state.cp[r]; h *= 1099511628211ull; }
-    h ^= g_state.xf[0x00E]; h *= 1099511628211ull;
-    h ^= g_state.xf[0x00F]; h *= 1099511628211ull;
+    for (int r = 0x30; r <= 0xBF; ++r) { h ^= g_pstate.cp[r]; h *= 1099511628211ull; }
+    h ^= s_parse_chan_ctrl[0]; h *= 1099511628211ull;
+    h ^= s_parse_chan_ctrl[1]; h *= 1099511628211ull;
     return h;
 }
 
@@ -564,8 +579,8 @@ static void ExpandDisplayList(uint32_t addr, uint32_t size,
     const uint8_t* src = nwii::runtime::g_mmu->get_ptr(0x80000000u | phys);
     // Prefer the copy taken when the game actually made the call -- guest RAM
     // may already hold the next frame's list by the time we get here.
-    std::vector<uint8_t> snap;
-    if (nwii::runtime::GX_DL_Fetch(addr, size, snap)) src = snap.data();
+    auto snap = nwii::runtime::GX_DL_Fetch(addr, size);
+    if (snap) src = snap->data();
 
     if (src && !nocache && depth == 0) {
         // Sampled content hash: stride 512 plus the tail, cheap even for
@@ -595,8 +610,8 @@ static void ExpandDisplayList(uint32_t addr, uint32_t size,
                     int array = 12 + ((c.val >> 24) & 0x3);
                     int num = (c.val >> 16) & 0xFF;
                     uint32_t index = c.val & 0xFFFF;
-                    uint32_t base = g_state.arrayBase[array] +
-                                    index * g_state.arrayStride[array];
+                    uint32_t base = g_pstate.arrayBase[array] +
+                                    index * g_pstate.arrayStride[array];
                     for (int i = 0; i < num && i < (int)c.payload.size(); i++)
                         c.payload[i] =
                             nwii::runtime::g_mmu->read_f32(base + i * 4);
@@ -705,6 +720,11 @@ namespace {
 } // namespace
 
 void FifoParser::DecodeDraw(GXCommand& c) {
+    static float s_cached_normal[3] = {0.0f, 0.0f, 0.0f};
+    DecodeDraw(c, s_cached_normal);
+}
+
+void FifoParser::DecodeDraw(GXCommand& c, float s_cached_normal[3]) {
     if (c.type != GXCommandType::DrawPrimitive || !c.raw || !c.vertices.empty())
         return;
     const DrawRaw& r = *c.raw;
@@ -750,20 +770,35 @@ void FifoParser::DecodeDraw(GXCommand& c) {
         const size_t nrm_idx_bytes =
             (r.vat.nrmMask == VtxAttrMask::Index16) ? 2 : 1;
 
-        if (r.vat.nrmMask != VtxAttrMask::None && r.need_normal) {
-            vtx.has_norm = true;
+        // XF latches the last normal it received; a lit vertex without one
+        // reuses it (Dolphin: "cached normal"). Spyro lights its logo-scene
+        // billboards with position-only vertices, which came out black with
+        // a zero normal. The cache is raw (model space) and goes through the
+        // normal matrix below like any other normal.
+        if (r.vat.nrmMask != VtxAttrMask::None) {
             float nbt[9];
+            // GX normals have a fixed exponent: S8 = 1.6 (/64), S16 = 1.14
+            // (/16384). Lighting normalises anyway, but normal-sourced
+            // texgens (sparkles, glows, env maps) need the real +-1 range.
+            const uint8_t nrm_shift = r.vat.nrmType == VtxAttrType::S8 ? 6
+                                    : r.vat.nrmType == VtxAttrType::S16 ? 14 : 0;
             if (!ReadVectorAttr(buf, off, buf_size, r.vat.nrmMask, r.vat.nrmType,
-                                0, r.arrayBase[1], r.arrayStride[1],
+                                nrm_shift, r.arrayBase[1], r.arrayStride[1],
                                 r.vat.nrmElements ? 9 : 3, nbt))
                 return;
             if (nrm_idx3) off += 2 * nrm_idx_bytes;
-            vtx.norm[0] = nbt[0]; vtx.norm[1] = nbt[1]; vtx.norm[2] = nbt[2];
-        } else {
-            off += AttrBytes(r.vat.nrmMask, r.vat.nrmType,
-                             r.vat.nrmElements ? 9 : 3, false);
-            if (nrm_idx3) off += 2 * nrm_idx_bytes;
+            s_cached_normal[0] = nbt[0];
+            s_cached_normal[1] = nbt[1];
+            s_cached_normal[2] = nbt[2];
         }
+        if (r.need_normal) {
+            vtx.has_norm = true;
+            vtx.norm[0] = s_cached_normal[0];
+            vtx.norm[1] = s_cached_normal[1];
+            vtx.norm[2] = s_cached_normal[2];
+        }
+        std::memcpy(vtx.raw_norm, s_cached_normal, sizeof(vtx.raw_norm));
+        std::memcpy(vtx.raw_pos, vtx.pos, sizeof(vtx.raw_pos));
         if (r.vat.clrMask[0] != VtxAttrMask::None) {
             float col[4];
             if (!ReadColorAttr(buf, off, buf_size, r.vat.clrMask[0],
@@ -893,13 +928,13 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             GXCommand c;
             c.reg = reg;
             if (kind == 0) {
-                uint32_t merged = (g_state.bp[reg] & ~mask) | (val & mask);
+                uint32_t merged = (g_pstate.bp[reg] & ~mask) | (val & mask);
                 ParseBP(reg, merged);
                 c.type = GXCommandType::BPRegister;
                 c.val = merged;
             } else {
-                uint32_t merged = (g_state.cp[reg] & ~mask) | (val & mask);
-                g_state.cp[reg] = merged;
+                uint32_t merged = (g_pstate.cp[reg] & ~mask) | (val & mask);
+                g_pstate.cp[reg] = merged;
                 ParseCP(reg, merged);
                 c.type = GXCommandType::CPRegister;
                 c.val = merged;
@@ -927,8 +962,8 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                 c.val = 0x80000000u | ((uint32_t)(array - 12) << 24) |
                         ((uint32_t)num << 16) | (index & 0xFFFF);
                 c.payload.resize(num);
-                uint32_t base = g_state.arrayBase[array] +
-                                index * g_state.arrayStride[array];
+                uint32_t base = g_pstate.arrayBase[array] +
+                                index * g_pstate.arrayStride[array];
                 for (int i = 0; i < num; i++)
                     c.payload[i] = nwii::runtime::g_mmu->read_f32(base + i * 4);
                 if (gx_trace()) {
@@ -936,7 +971,7 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                     if (ln++ < 24) {
                         printf("[GXTRACE] LOAD_INDX arr=%d idx=%u xf=0x%03X n=%d base=0x%X stride=%u [",
                                array, index, xf_addr, num, base,
-                               g_state.arrayStride[array]);
+                               g_pstate.arrayStride[array]);
                         for (int i = 0; i < num && i < 8; i++)
                             printf("%.3f ", c.payload[i]);
                         printf("]\n");
@@ -988,6 +1023,15 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             c.type = GXCommandType::XFRegister;
             c.length = length;
             c.reg = (fifo[offset + 3] << 8) | fifo[offset + 4];
+
+            // Parse-time shadow of the colour channel controls: g_state.xf is
+            // only updated when the renderer replays the frame, so reading it
+            // here gave the previous frame's last value.
+            for (int i = 0; i <= length; i++) {
+                const int r = c.reg + i;
+                if (r == 0x100E || r == 0x100F)
+                    s_parse_chan_ctrl[r - 0x100E] = Read32(fifo, offset + 5 + i * 4);
+            }
 
             if (gx_trace() && c.reg >= 0x1020 && c.reg <= 0x1027) {
                 static int xf_print_proj = 0;
@@ -1049,7 +1093,7 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             uint16_t vtx_count = (fifo[offset + 1] << 8) | fifo[offset + 2];
             uint8_t vat_idx = cmd & 0x07;
 
-            VATSlot& vat = g_state.vat[vat_idx];
+            VATSlot& vat = g_pstate.vat[vat_idx];
 
             // Vertex size is constant for a draw (every attribute is either
             // direct with a fixed byte width or a fixed 1/2-byte index), so
@@ -1066,8 +1110,8 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             c.prim_type = cmd & 0xF8;
             c.raw = std::make_shared<DrawRaw>();
             c.raw->vat = vat;
-            c.raw->defPosMtxIdx = g_state.defPosMtxIdx;
-            std::memcpy(c.raw->defTexMtxIdx, g_state.defTexMtxIdx, 8);
+            c.raw->defPosMtxIdx = g_pstate.defPosMtxIdx;
+            std::memcpy(c.raw->defTexMtxIdx, g_pstate.defTexMtxIdx, 8);
             // Snapshot this draw's position/normal matrix from the parse-time
             // shadow, unless the draw carries a per-vertex matrix index (then
             // each vertex may use a different matrix — fall back to live).
@@ -1082,8 +1126,8 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
                     c.raw->snap_nrm_bank.assign(g_parse_nrmmtx, g_parse_nrmmtx + 96);
                 }
             } else {
-                uint32_t pb = (uint32_t)g_state.defPosMtxIdx * 4;
-                uint32_t nb = 3u * (g_state.defPosMtxIdx & 31);
+                uint32_t pb = (uint32_t)g_pstate.defPosMtxIdx * 4;
+                uint32_t nb = 3u * (g_pstate.defPosMtxIdx & 31);
                 if (pb + 12 <= 256 && nb + 9 <= 96) {
                     const float* pm = &g_parse_posmtx[pb];
                     // Only trust the snapshot if the slot was actually written
@@ -1101,15 +1145,15 @@ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::v
             if (g_skindbg) {
                 g_skin_draws_total++;
                 if (vat.posMatIdx) g_skin_draws_pmidx++;
-                if (g_state.defPosMtxIdx != 0) g_skin_defnz++;
+                if (g_pstate.defPosMtxIdx != 0) g_skin_defnz++;
                 if (c.raw->have_snap_mtx) g_skin_snapped++;
             }
             // Normals only matter when a colour channel is lit (XF 0x100e/0x100f
             // bit1); decoding them otherwise is pure cost.
-            c.raw->need_normal = ((g_state.xf[0x00E] >> 1) & 1) ||
-                                 ((g_state.xf[0x00F] >> 1) & 1);
-            std::memcpy(c.raw->arrayBase, g_state.arrayBase, sizeof(c.raw->arrayBase));
-            std::memcpy(c.raw->arrayStride, g_state.arrayStride, sizeof(c.raw->arrayStride));
+            c.raw->need_normal = ((s_parse_chan_ctrl[0] >> 1) & 1) ||
+                                 ((s_parse_chan_ctrl[1] >> 1) & 1);
+            std::memcpy(c.raw->arrayBase, g_pstate.arrayBase, sizeof(c.raw->arrayBase));
+            std::memcpy(c.raw->arrayStride, g_pstate.arrayStride, sizeof(c.raw->arrayStride));
             c.raw->count = vtx_count;
             c.raw->bytes.assign(fifo.begin() + offset + 3, fifo.begin() + offset + need);
             static const bool vatdbg = std::getenv("NWII_VATDBG") != nullptr;

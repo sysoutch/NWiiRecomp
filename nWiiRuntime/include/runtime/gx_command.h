@@ -17,6 +17,10 @@ struct VertexData {
     float norm[3];
     float color[4];
     float tex[8][2];
+    // Untransformed (model-space) position and normal: texgen sources. The
+    // normal is the XF-latched one when the vertex has none.
+    float raw_pos[3] = {0, 0, 0};
+    float raw_norm[3] = {0, 0, 0};
 
     bool has_pos = false;
     bool has_norm = false;

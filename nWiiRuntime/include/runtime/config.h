@@ -33,7 +33,15 @@ struct GameProfile {
     
 
     uint32_t sched_lock_offset = 0;
+
+    // __OSReschedule address: run after an external interrupt so a thread the
+    // handler woke (e.g. the VI retrace queue) can preempt (NWII_RESCHED).
+    uint32_t resched_addr = 0;
 };
+
+// Timebase from real elapsed time instead of the instruction count
+// ([hle] wall_timebase or NWII_WALLTB); read on the hot path, so a plain flag.
+extern bool g_wall_timebase;
 
 class Config {
 public:
@@ -52,6 +60,18 @@ public:
     bool enable_vsync = true;
     int window_width = 640;
     int window_height = 480;
+    int internal_scale = 1; // EFB render scale (1 = native 640x480)
+    int msaa = 1;           // multisample count for the EFB (1 = off)
+    int anisotropy = 1;     // max anisotropic filtering for linear-filtered textures
+    bool widescreen = false; // 16:9 output with a widened 3D field of view
+    bool fullscreen = false; // borderless fullscreen on the current display
+    bool show_fps = false;   // small game-FPS counter in the corner
+    int frame_rate = 60;     // VI retrace rate = max game fps (60, 90 or 120)
+    int volume = 100;        // [audio] master volume, percent
+    bool mute = false;
+    bool launcher = true;    // [launcher] enabled: title menu before the game boots
+    std::vector<std::string> recent_discs; // [launcher] recent, newest first
+    std::string config_path; // the TOML loaded; the settings overlay saves here
     std::string game_dir;
 
     

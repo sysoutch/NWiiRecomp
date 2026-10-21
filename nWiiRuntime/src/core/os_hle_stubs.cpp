@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <set>
 #include <string>
 
@@ -43,6 +44,17 @@ void watch_hit(uint32_t addr, uint32_t value, int width) {
     std::cout << " pc=0x" << c->pc << " lr=0x" << c->lr;
 
     
+    // NWII_WATCH_STACK=1: guest call chain (saved LRs on the r1 back chain).
+    static const bool wstk = std::getenv("NWII_WATCH_STACK") != nullptr;
+    if (wstk) {
+      std::cout << " stack:";
+      uint32_t sp = c->gpr[1];
+      for (int i = 0; i < 16 && sp >= 0x80000000u && sp < 0x81800000u; ++i) {
+        sp = c->mmu.read32(sp);
+        if (sp < 0x80000000u || sp >= 0x81800000u) break;
+        std::cout << " 0x" << std::hex << c->mmu.read32(sp + 4);
+      }
+    }
     static const bool regs = std::getenv("NWII_WATCH_REGS") != nullptr;
     if (regs) {
       for (int r = 24; r <= 31; ++r)
@@ -79,13 +91,83 @@ void note_null_call(uint32_t site, uint32_t lr) {
 
 void trace_call(uint32_t func_addr, CPUContext &ctx) {
   if (!g_trace_only.empty() && !g_trace_only.count(func_addr)) return;
+  // NWII_WATCH_ARM=<reg>,<hexoff>,<nth>: on the nth traced call, point the
+  // NWII_WATCH watchpoint at gpr[reg]+off (heap objects move between runs)
+  // and stop printing calls.
+  // NWII_STATE_LOG=<reg>,<hexoff>: per object gpr[reg], print the halfword at
+  // +off whenever it differs from the previous traced call (state machines).
+  if (static const char *sl = std::getenv("NWII_STATE_LOG"); sl) {
+    static std::map<uint32_t, uint32_t> last;
+    int reg = 4; unsigned off = 10;
+    std::sscanf(sl, "%d,%x", &reg, &off);
+    const uint32_t obj = ctx.gpr[reg & 31];
+    const uint32_t v = ctx.mmu.read16(obj + off);
+    auto it = last.find(obj);
+    if (it == last.end() || it->second != v) {
+      std::cout << "[STATE] obj=0x" << std::hex << obj << " " << std::dec
+                << (it == last.end() ? -1 : (int)it->second) << " -> " << v
+                << " lr=0x" << std::hex << ctx.lr << std::dec << "\n";
+      last[obj] = v;
+    }
+    return;
+  }
+  if (static const char *arm = std::getenv("NWII_WATCH_ARM"); arm) {
+    static uint32_t calls = 0;
+    int reg = 0; unsigned off = 0, nth = 1;
+    std::sscanf(arm, "%d,%x,%u", &reg, &off, &nth);
+    if (++calls == nth) {
+      g_watch_addr = ctx.gpr[reg & 31] + off;
+      std::cout << "[Watch] armed 0x" << std::hex << g_watch_addr << std::dec << "\n";
+    }
+    return;
+  }
   std::cout << "[CALL] 0x" << std::hex << func_addr << " lr=0x" << ctx.lr
             << " r3=0x" << ctx.gpr[3] << " r4=0x" << ctx.gpr[4] << " r5=0x"
             << ctx.gpr[5] << " r6=0x" << ctx.gpr[6] << " r7=0x" << ctx.gpr[7]
+            << " r8=0x" << ctx.gpr[8] << " r9=0x" << ctx.gpr[9] << " r10=0x" << ctx.gpr[10]
             << " r13=0x" << ctx.gpr[13] << " r1=0x" << ctx.gpr[1]
-            << std::dec << "\n";
+            << std::dec;
+  // NWII_TRACE_STR=1: also print r3 as a guest C string (path arguments).
+  static const bool str = std::getenv("NWII_TRACE_STR") != nullptr;
+  if (str && ctx.gpr[3] >= 0x80000000u && ctx.gpr[3] < 0x81800000u) {
+    std::string s;
+    for (uint32_t a = ctx.gpr[3]; s.size() < 96; ++a) {
+      const char c = (char)ctx.mmu.read8(a);
+      if (c < 32 || c > 126) break;
+      s += c;
+    }
+    std::cout << " \"" << s << "\"";
+  }
+  // NWII_TRACE_MEM=<reg>,<hexoff>,<words>: also print guest words at
+  // gpr[reg]+off (argument structs).
+  if (static const char *tm = std::getenv("NWII_TRACE_MEM"); tm) {
+    int reg = 4; unsigned off = 0, n = 4;
+    std::sscanf(tm, "%d,%x,%u", &reg, &off, &n);
+    std::cout << " mem:";
+    for (unsigned i = 0; i < n && i < 32; ++i)
+      std::cout << " " << std::hex << ctx.mmu.read32(ctx.gpr[reg & 31] + off + i * 4) << std::dec;
+  }
+  // NWII_TRACE_GQR=1: also print the quantization registers.
+  static const bool tgqr = std::getenv("NWII_TRACE_GQR") != nullptr;
+  if (tgqr) {
+    std::cout << " gqr:";
+    for (int i = 0; i < 8; ++i) std::cout << " " << std::hex << ctx.gqr[i] << std::dec;
+  }
+  // NWII_TRACE_STACK=1: also print the guest call chain (saved LRs found by
+  // walking the r1 back chain).
+  static const bool stk = std::getenv("NWII_TRACE_STACK") != nullptr;
+  if (stk) {
+    std::cout << " stack:";
+    uint32_t sp = ctx.gpr[1];
+    for (int i = 0; i < 16 && sp >= 0x80000000u && sp < 0x81800000u; ++i) {
+      sp = ctx.mmu.read32(sp);
+      if (sp < 0x80000000u || sp >= 0x81800000u) break;
+      std::cout << " 0x" << std::hex << ctx.mmu.read32(sp + 4) << std::dec;
+    }
+  }
+  std::cout << "\n";
 }
-} 
+}
 
 static std::string read_guest_string(CPUContext &ctx, uint32_t addr) {
   std::string str;

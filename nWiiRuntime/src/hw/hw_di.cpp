@@ -9,6 +9,11 @@ namespace nwii::runtime { extern CPUContext* g_ctx_ptr; }
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <cstdlib>
+
+// Cached: std::getenv takes a lock and scans the environment, and these
+// checks sit on the per-branch interrupt-poll path.
+static const bool s_env_sample = std::getenv("NWII_SAMPLE") != nullptr;
 
 namespace nwii::runtime {
     extern MMU* g_mmu;
@@ -75,6 +80,19 @@ static void di_execute() {
             std::cout << "[HW DI] SUSPECT dst: di_mar=0x" << std::hex << di_mar
                       << " pc=0x" << nwii::runtime::g_ctx_ptr->pc << " lr=0x"
                       << nwii::runtime::g_ctx_ptr->lr << std::dec << "\n";
+            // Walk the guest back chain so the caller that handed DVDRead a
+            // bad buffer can be found from the log.
+            auto *c = nwii::runtime::g_ctx_ptr;
+            std::cout << "[HW DI]   chain:";
+            uint32_t sp = c->gpr[1];
+            for (int i = 0; i < 16 && sp >= 0x80000000u && sp < 0x81800000u; ++i) {
+                std::cout << " 0x" << std::hex << c->mmu.read32(sp + 4);
+                sp = c->mmu.read32(sp);
+            }
+            std::cout << "\n[HW DI]   gpr:";
+            for (int i = 3; i <= 12; ++i)
+                std::cout << " r" << std::dec << i << "=0x" << std::hex << c->gpr[i];
+            std::cout << std::dec << "\n";
         }
         if (nwii::runtime::g_mmu && length > 0 && length < 0x4000000) {
             std::vector<uint8_t> tmp(length, 0);
@@ -86,7 +104,19 @@ static void di_execute() {
             }
             for (uint32_t i = 0; i < length; ++i)
                 nwii::runtime::g_mmu->write8(dst + i, tmp[i]);
-            std::cout << "[HW DI] DMA read off=0x" << std::hex << offset
+            // NWII_DILOG=1: every disc read with time and file.
+            static const bool dilog = std::getenv("NWII_DILOG") != nullptr;
+            if (dilog) {
+                static const auto t0 = std::chrono::steady_clock::now();
+                std::string name = vd.name_at(offset);
+                const size_t slash = name.find_last_of("/\\");
+                if (slash != std::string::npos) name = name.substr(slash + 1);
+                std::printf("[DI] %.2fs off=0x%llx len=0x%x %s\n",
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                            (unsigned long long)offset, length, name.c_str());
+                std::fflush(stdout);
+            }
+            if (nwii::runtime::g_verbose) std::cout << "[HW DI] DMA read off=0x" << std::hex << offset
                       << " len=0x" << length << " dst=0x" << dst << std::dec << "\n";
         }
 
@@ -189,7 +219,7 @@ void register_di(MMIODispatcher& dispatcher) {
         },
         [](uint32_t addr, uint32_t val) {
             if (addr == 0xCC006000) {
-                if (std::getenv("NWII_SAMPLE")) std::cout << "[HW DI] Write to di_sr: 0x" << std::hex << val << std::dec << "\n";
+                if (s_env_sample) std::cout << "[HW DI] Write to di_sr: 0x" << std::hex << val << std::dec << "\n";
                 
                 uint32_t w1c = val & (SR_BRK | SR_DEINT | SR_TCINT);
                 uint32_t masks = SR_DEINTMASK | SR_TCINTMASK | SR_BRKINTMASK;

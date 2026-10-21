@@ -1,4 +1,5 @@
 #include "loader/loader.h"
+#include "runtime/disc_image.h"
 #include <fstream>
 #include <iostream>
 #include <filesystem>
@@ -13,9 +14,15 @@ bool Executable::load_dol(const std::string& path) {
         std::cerr << "Failed to open " << path << std::endl;
         return false;
     }
+    return load_dol_from([&](uint64_t offset, void* dst, size_t len) {
+        file.seekg(offset, std::ios::beg);
+        return (bool)file.read(reinterpret_cast<char*>(dst), len);
+    });
+}
 
+bool Executable::load_dol_from(const std::function<bool(uint64_t, void*, size_t)>& read) {
     DolHeader header;
-    if (!file.read(reinterpret_cast<char*>(&header), sizeof(DolHeader))) {
+    if (!read(0, &header, sizeof(DolHeader))) {
         std::cerr << "Failed to read DOL header" << std::endl;
         return false;
     }
@@ -32,8 +39,7 @@ bool Executable::load_dol(const std::string& path) {
         sec.is_bss = false;
         sec.data.resize(sec.size);
 
-        file.seekg(header.text_offsets[i], std::ios::beg);
-        file.read(reinterpret_cast<char*>(sec.data.data()), sec.size);
+        read(header.text_offsets[i], sec.data.data(), sec.size);
 
         sections.push_back(std::move(sec));
     }
@@ -48,8 +54,7 @@ bool Executable::load_dol(const std::string& path) {
         sec.is_bss = false;
         sec.data.resize(sec.size);
 
-        file.seekg(header.data_offsets[i], std::ios::beg);
-        file.read(reinterpret_cast<char*>(sec.data.data()), sec.size);
+        read(header.data_offsets[i], sec.data.data(), sec.size);
 
         sections.push_back(std::move(sec));
     }
@@ -208,7 +213,18 @@ bool Executable::load_unpacked_game(const std::string& path) {
             return false;
         }
     } else {
-        
+        // A GameCube disc image (.iso/.gcm/RVZ): the DOL sits at boot.bin's offset.
+        if (auto img = nwii::runtime::DiscImage::open(path)) {
+            unsigned char boot[0x440] = {};
+            if (!img->read(0, sizeof(boot), boot)) return false;
+            nwii::runtime::Config::get().game_id = std::string(reinterpret_cast<char*>(boot), 6);
+            std::cout << "[Loader] Disc image, Game ID " << nwii::runtime::Config::get().game_id << std::endl;
+            const uint64_t dol_off = ((uint32_t)boot[0x420] << 24) | ((uint32_t)boot[0x421] << 16) |
+                                     ((uint32_t)boot[0x422] << 8) | boot[0x423];
+            return load_dol_from([&](uint64_t offset, void* dst, size_t len) {
+                return img->read(dol_off + offset, (uint32_t)len, static_cast<uint8_t*>(dst));
+            });
+        }
         if (!std::filesystem::exists(dol_path)) {
             std::cerr << "File does not exist: " << dol_path << std::endl;
             return false;

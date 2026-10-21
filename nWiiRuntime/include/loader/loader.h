@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <functional>
 #include "common/endian.h"
 
 namespace nwii {
@@ -37,6 +38,8 @@ public:
     std::vector<Section> sections;
 
     bool load_dol(const std::string& path);
+    // DOL read through `read(offset in the DOL, dst, len)` (e.g. from a disc image).
+    bool load_dol_from(const std::function<bool(uint64_t, void*, size_t)>& read);
     bool load_unpacked_game(const std::string& directory_path);
 
     

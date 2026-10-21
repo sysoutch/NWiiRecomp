@@ -1,4 +1,5 @@
 #include "gamepad_source.h"
+#include "input/key_bindings.h"
 #include "runtime/config.h"
 #include <SDL.h>
 #include <cmath>
@@ -64,18 +65,14 @@ void GamepadSource::update(GameCubePadState pads[4], WiimoteState motes[4]) {
         if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) motes[i].buttons |= 0x0001;
         if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) motes[i].buttons |= 0x0002;
 
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_A)) pads[i].buttons |= 0x0100; 
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_B)) pads[i].buttons |= 0x0200; 
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_START)) pads[i].buttons |= 0x1000;  
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_X)) pads[i].buttons |= 0x0400; 
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_Y)) pads[i].buttons |= 0x0800; 
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP)) pads[i].buttons |= 0x0008;
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) pads[i].buttons |= 0x0004;
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) pads[i].buttons |= 0x0001;
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pads[i].buttons |= 0x0002;
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) pads[i].buttons |= 0x0040;  
-        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pads[i].buttons |= 0x0020; 
-        if (SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16384) pads[i].buttons |= 0x0010; 
+        // GameCube buttons from the rebindable table (input/key_bindings.h),
+        // PadControl order: A, B, X, Y, Z, L, R, Start, D-pad up/down/left/right.
+        static const uint16_t kPadBits[kNumPadButtonBindings] = {
+            0x0100, 0x0200, 0x0400, 0x0800, 0x0010, 0x0040, 0x0020, 0x1000,
+            0x0008, 0x0004, 0x0001, 0x0002};
+        const PadBinding *pb = pad_bindings();
+        for (int b = 0; b < kNumPadButtonBindings; ++b)
+            if (pad_input_pressed(controller, pb[b].input)) pads[i].buttons |= kPadBits[b];
 
         int lx = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
         int ly = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
@@ -89,8 +86,9 @@ void GamepadSource::update(GameCubePadState pads[4], WiimoteState motes[4]) {
             if (std::abs(ry) > 8000) pads[i].substick_y = (int8_t)((-ry / 32767.0f) * 127.0f);
         }
         
-        pads[i].trigger_l = (uint8_t)((SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 32767.0f) * 255.0f);
-        pads[i].trigger_r = (uint8_t)((SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 32767.0f) * 255.0f);
+        // Analog L/R follow whatever L/R are bound to (a button reads 0 or 255).
+        pads[i].trigger_l = pad_input_analog(controller, pb[(int)PadControl::L].input);
+        pads[i].trigger_r = pad_input_analog(controller, pb[(int)PadControl::R].input);
     }
 }
 

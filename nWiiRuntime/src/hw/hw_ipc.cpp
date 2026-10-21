@@ -6,6 +6,10 @@
 #include <cstring>
 #include <algorithm>
 
+// Cached: std::getenv takes a lock and scans the environment, and these
+// checks sit on the per-branch interrupt-poll path.
+static const bool s_env_sample = std::getenv("NWII_SAMPLE") != nullptr;
+
 namespace nwii::runtime {
     extern CPUContext* g_ctx_ptr;
     extern MMU* g_mmu;
@@ -111,7 +115,7 @@ void register_ipc(MMIODispatcher& dispatcher) {{
             case 0x00000C: {
                 ipc_arm_ctrl &= ~(val & 0x03);
                 if (!(ipc_arm_ctrl & 3)) {
-                    if (std::getenv("NWII_SAMPLE") && (pi_intsr & 0x4000)) {
+                    if (s_env_sample && (pi_intsr & 0x4000)) {
                         static int n = 0;
                         if (n++ < 6)
                             std::cout << "[IPC] armctrl write 0x" << std::hex

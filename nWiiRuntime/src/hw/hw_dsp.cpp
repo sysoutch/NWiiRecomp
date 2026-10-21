@@ -1,6 +1,8 @@
 #include "runtime/hw/hw.h"
 #include "runtime/config.h"
 #include "runtime/cpu_context.h"
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -61,8 +63,14 @@ static void ar_dma_execute() {
 
     
     
+    // The copy above is instant, so complete almost at once. A size-based
+    // delay (count/2 ticks: ~1.6 ms for 128 KB) let our faster-than-real DVD
+    // reads finish first: Spyro's sound-bank loader re-posted the same ARQ
+    // request struct while it was still queued, which corrupted ARQ's list,
+    // started a zero-length DMA and jammed the queue -- after that no stream
+    // (music, Sparx's dialogue) ever got its first chunk into ARAM.
     EventScheduler::get().schedule_after(
-        (uint64_t)count / 2 + 64, [](CPUContext&, uint64_t) {
+        200, [](CPUContext&, uint64_t) {
             ar_cnt = 0;
             dsp_control |= 0x0020;
             dsp_update_pi();
@@ -91,6 +99,15 @@ size_t dsp_audio_pull(int16_t* out, size_t frames) {
     return n;
 }
 
+// Up to `frames` produced frames, without padding; returns how many.
+size_t dsp_audio_take(int16_t* out, size_t frames) {
+    std::lock_guard<std::mutex> lock(adma_mutex);
+    const size_t n = std::min(adma_ring.size() / 2, frames);
+    std::memcpy(out, adma_ring.data(), n * 2 * sizeof(int16_t));
+    adma_ring.erase(adma_ring.begin(), adma_ring.begin() + n * 2);
+    return n;
+}
+
 static void adma_event_cb(CPUContext& ctx, uint64_t late) {
     if (!(adma_control & 0x8000))
         return;
@@ -101,10 +118,37 @@ static void adma_event_cb(CPUContext& ctx, uint64_t late) {
         
         if (adma_ring.size() < 32000 * 2) {
             uint32_t va = adma_addr | 0x80000000;
+            // The DSP's output frames are (right, left) pairs; the host
+            // stream is (left, right).
             for (uint32_t i = 0; i + 3 < bytes; i += 4) {
-                adma_ring.push_back((int16_t)g_mmu->read16(va + i));
                 adma_ring.push_back((int16_t)g_mmu->read16(va + i + 2));
+                adma_ring.push_back((int16_t)g_mmu->read16(va + i));
             }
+        }
+        // NWII_WAVDUMP=<path>: record everything the audio DMA plays
+        // (32 kHz stereo s16) for offline listening.
+        static FILE *wav = nullptr;
+        static uint32_t wav_bytes = 0;
+        static const char *wav_path = std::getenv("NWII_WAVDUMP");
+        if (wav_path && !wav) {
+            wav = std::fopen(wav_path, "wb");
+            static const uint8_t hdr[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',
+                16,0,0,0,1,0,2,0,0x00,0x7D,0,0,0x00,0xF4,0x01,0,4,0,16,0,'d','a','t','a',0,0,0,0};
+            if (wav) std::fwrite(hdr, 1, sizeof(hdr), wav);
+        }
+        if (wav) {
+            const uint32_t va = adma_addr | 0x80000000;
+            for (uint32_t i = 0; i + 3 < bytes; i += 4) {
+                const int16_t lr[2] = {(int16_t)g_mmu->read16(va + i + 2),
+                                       (int16_t)g_mmu->read16(va + i)};
+                std::fwrite(lr, sizeof(lr), 1, wav);
+                wav_bytes += 4;
+            }
+            // Keep the header sizes current so the file is valid at any time.
+            const uint32_t riff = 36 + wav_bytes;
+            std::fseek(wav, 4, SEEK_SET); std::fwrite(&riff, 4, 1, wav);
+            std::fseek(wav, 40, SEEK_SET); std::fwrite(&wav_bytes, 4, 1, wav);
+            std::fseek(wav, 0, SEEK_END);
         }
     }
     
@@ -206,8 +250,20 @@ void register_dsp(MMIODispatcher& dispatcher) {{
                             });
                     };
                     if (s_ax_state == 1) {
-                        
-                        reply(0x0002); 
+                        // NWII_AXTRACE: dump the AX command list this mail
+                        // points at (word count from the preceding 0xBABE).
+                        static const bool axtrace = std::getenv("NWII_AXTRACE") != nullptr;
+                        static int dumped = 0;
+                        if (axtrace && g_mmu && dumped++ < 6) {
+                            std::cout << "[AXcmd] list @0x" << std::hex << mail << ":";
+                            for (int i = 0; i < 48; ++i)
+                                std::cout << " " << g_mmu->read16(0x80000000u | ((mail + i * 2) & 0x01FFFFFF));
+                            std::cout << std::dec << "\n";
+                        }
+                        // Run the AX microcode on it before signalling the
+                        // yield, as the real DSP finishes the frame first.
+                        ax_process_command_list(mail);
+                        reply(0x0002);
                         s_ax_state = 2;
                     } else if ((mail & 0xFFFF0000u) == 0xBABE0000u) {
                         s_ax_state = 1;

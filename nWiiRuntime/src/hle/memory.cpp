@@ -139,7 +139,10 @@ void OSAllocFromHeap(CPUContext& ctx) {
         current_block += 32 + size;
     }
     
-    std::cerr << "[HLE Memory] ERROR: OSAllocFromHeap OOM handle " << std::dec << handle << "\n";
+    std::cerr << "[HLE Memory] ERROR: OSAllocFromHeap OOM handle " << std::dec << handle
+              << " req=0x" << std::hex << req_size << " walk stopped at 0x" << current_block
+              << " (magic 0x" << ctx.mmu.read32(current_block + 0x18) << ") heap 0x"
+              << heap_start << "-0x" << heap_end << " lr=0x" << ctx.lr << std::dec << "\n";
     ctx.gpr[3] = 0;
 }
 

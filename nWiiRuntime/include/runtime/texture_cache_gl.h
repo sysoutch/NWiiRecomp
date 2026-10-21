@@ -80,17 +80,26 @@ public:
     // EFB copy-to-texture: the renderer registers the GL texture holding an
     // EFB copy under the guest RAM address the game targeted; a texture stage
     // whose base_addr matches samples that copy directly (guest RAM was never
-    // written, decoding it would show garbage).
-    void register_efb_texture(uint32_t addr, GLuint tex);
-    GLuint find_efb_texture(uint32_t addr) const;
+    // written, decoding it would show garbage). A sampled checksum of that
+    // RAM is kept: once the game writes other data there (e.g. a font loaded
+    // where a loading-screen copy lived), the copy no longer applies.
+    void register_efb_texture(uint32_t addr, GLuint tex, uint32_t bytes);
+    GLuint find_efb_texture(uint32_t addr);
 
     void clear();
 
 private:
     TextureCache() = default;
 
-    std::unordered_map<TextureKey, GLuint, TextureKeyHash> cache;
-    std::unordered_map<uint32_t, GLuint> efb_textures;
+    struct Entry {
+        GLuint tex;
+        uint64_t last_use; // use counter value at the last lookup (LRU)
+    };
+    std::unordered_map<TextureKey, Entry, TextureKeyHash> cache;
+    uint64_t use_counter = 0;
+    void evict_lru();
+    struct EfbTexture { GLuint tex; uint32_t bytes; uint32_t ram_hash; };
+    std::unordered_map<uint32_t, EfbTexture> efb_textures;
 
     Image decode_texture(CPUContext& ctx, const gx::TexStage& stage);
 

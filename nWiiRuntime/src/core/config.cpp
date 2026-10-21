@@ -1,12 +1,19 @@
 #include "runtime/config.h"
+#include "input/key_bindings.h"
 #include <toml++/toml.hpp>
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <filesystem>
 
 namespace nwii {
 namespace runtime {
 
+bool g_wall_timebase = std::getenv("NWII_WALLTB") != nullptr;
+bool g_verbose = std::getenv("NWII_VERBOSE") != nullptr;
+
 void Config::load(const std::string& filepath) {
+    config_path = filepath;
     if (!std::filesystem::exists(filepath)) {
         std::cout << "[Config] Config file " << filepath << " not found, using defaults." << std::endl;
         return;
@@ -48,6 +55,52 @@ void Config::load(const std::string& filepath) {
 
         auto h = tbl["graphics"]["window_height"].value<int>();
         if (h) window_height = *h;
+
+        if (auto v = tbl["graphics"]["internal_scale"].value<int>())
+            internal_scale = std::clamp(*v, 1, 8);
+        if (auto v = tbl["graphics"]["msaa"].value<int>())
+            msaa = std::clamp(*v, 1, 16);
+        if (auto v = tbl["graphics"]["anisotropy"].value<int>())
+            anisotropy = std::clamp(*v, 1, 16);
+        if (auto v = tbl["graphics"]["widescreen"].value<bool>())
+            widescreen = *v;
+        if (auto v = tbl["graphics"]["fullscreen"].value<bool>())
+            fullscreen = *v;
+        if (auto v = tbl["graphics"]["show_fps"].value<bool>())
+            show_fps = *v;
+        if (auto v = tbl["graphics"]["frame_rate"].value<int>())
+            frame_rate = *v >= 120 ? 120 : *v >= 90 ? 90 : 60;
+        if (auto v = tbl["audio"]["volume"].value<int>())
+            volume = std::clamp(*v, 0, 100);
+        if (auto v = tbl["audio"]["mute"].value<bool>())
+            mute = *v;
+        if (auto v = tbl["launcher"]["enabled"].value<bool>())
+            launcher = *v;
+        if (auto *arr = tbl["launcher"]["recent"].as_array())
+            for (auto &&el : *arr)
+                if (auto path = el.value<std::string>()) {
+                    try {
+                        recent_discs.push_back(
+                            std::filesystem::path(std::u8string(path->begin(), path->end())).string());
+                    } catch (const std::exception &) {} // not representable here
+                }
+        if (auto *kb = tbl["keyboard"].as_table()) {
+            for (auto &&[k, v] : *kb)
+                if (auto name = v.value<std::string>();
+                    !name || !input::set_key_binding(std::string(k.str()), *name))
+                    std::cout << "[Config] [keyboard] " << k.str()
+                              << ": unknown control or key name" << std::endl;
+        }
+        if (auto *pad = tbl["controller"].as_table()) {
+            for (auto &&[k, v] : *pad)
+                if (auto name = v.value<std::string>();
+                    !name || !input::set_pad_binding(std::string(k.str()), *name))
+                    std::cout << "[Config] [controller] " << k.str()
+                              << ": unknown control or input name" << std::endl;
+        }
+        std::cout << "[Config] internal_scale " << internal_scale << "x, msaa "
+                  << msaa << "x, anisotropy " << anisotropy << "x, widescreen "
+                  << (widescreen ? "on" : "off") << std::endl;
 
         auto gid = tbl["game"]["id"].value<std::string>();
         if (gid) {
@@ -94,6 +147,20 @@ void Config::load(const std::string& filepath) {
             std::cout << "[Config] sched_lock_offset = 0x"
                       << std::hex << game_profile.sched_lock_offset
                       << std::dec << std::endl;
+        }
+
+        auto rs = tbl["hle"]["resched"].value<int64_t>();
+        if (rs && *rs != 0) {
+            game_profile.resched_addr = (uint32_t)*rs;
+            std::cout << "[Config] resched = 0x" << std::hex
+                      << game_profile.resched_addr << std::dec << std::endl;
+        }
+
+        auto wtb = tbl["hle"]["wall_timebase"].value<bool>();
+        if (wtb) {
+            g_wall_timebase = *wtb;
+            std::cout << "[Config] wall_timebase = " << (*wtb ? "on" : "off")
+                      << std::endl;
         }
 
     } catch (const toml::parse_error& err) {

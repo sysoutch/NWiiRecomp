@@ -26,11 +26,15 @@ void vi_trigger_interrupt();
 void ipc_post_reply(uint32_t req_addr); 
 void ai_update();
 void dsp_trigger_interrupt();
+void ax_process_command_list(uint32_t addr); // AX microcode HLE (hw_ax.cpp)
 
 int dsp_pending_os_interrupt();
+int exi_pending_os_interrupt();
 void di_tick();  
 
 size_t dsp_audio_pull(int16_t* out, size_t frames);
+// Like dsp_audio_pull, but returns only what was produced (no zero padding).
+size_t dsp_audio_take(int16_t* out, size_t frames);
 void pe_signal_token(uint32_t token, bool raise_interrupt); 
 void pe_signal_finish();                                    
 
@@ -45,6 +49,7 @@ void register_vi(MMIODispatcher &dispatcher);
 void register_dsp(MMIODispatcher &dispatcher);
 void register_ai(MMIODispatcher &dispatcher);
 void register_di(MMIODispatcher &dispatcher);
+void register_exi(MMIODispatcher &dispatcher);
 void register_ipc(MMIODispatcher &dispatcher);
 
 void register_all_hw(MMIODispatcher &dispatcher);

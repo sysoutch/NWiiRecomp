@@ -21,6 +21,22 @@ using namespace nwii::runtime;
 namespace nwii::runtime {
     std::string read_guest_string(CPUContext &ctx, uint32_t addr, int max_len = 256);
     bool valid_callback(uint32_t cb);
+
+    // See poll_callbacks(): TSC cycles per NWII_POLL_US microseconds
+    // (default 20), measured once over ~5 ms. 0 (no TSC, or NWII_POLL_US=0)
+    // keeps the gate open: every 16th back-edge does the full check.
+    uint64_t g_poll_cycles = [] {
+        const char *e = std::getenv("NWII_POLL_US");
+        const uint64_t us = e ? std::strtoull(e, nullptr, 10) : 20;
+        if (us == 0) return uint64_t{0};
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t c0 = nwii_cycles();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(5)) {}
+        const uint64_t c1 = nwii_cycles();
+        const double el_us = std::chrono::duration<double, std::micro>(
+                                 std::chrono::steady_clock::now() - t0).count();
+        return el_us > 0 ? (uint64_t)((double)(c1 - c0) / el_us * (double)us) : uint64_t{0};
+    }();
 }
 
 #include "runtime/ios_device.h"
@@ -680,6 +696,10 @@ bool handle_syscall(CPUContext &ctx) {
 
 #include "runtime/cpu_context.h"
 
+// Cached: std::getenv takes a lock and scans the environment, and these
+// checks sit on the per-branch interrupt-poll path.
+static const bool s_env_sample = std::getenv("NWII_SAMPLE") != nullptr;
+
 namespace nwii::runtime {
 
 
@@ -703,7 +723,7 @@ void hle_drive_thread_queue(CPUContext& ctx) {
 
 
 static void hle_save_context_to_guest(CPUContext &ctx, uint32_t c) {
-  if (std::getenv("NWII_SAMPLE")) {
+  if (s_env_sample) {
       static int n = 0;
       if (n++ < 40)
           std::cout << "[CtxSave] #" << n << " ctx=0x" << std::hex << c
@@ -785,10 +805,152 @@ static bool hle_load_context_from_guest(CPUContext &ctx) {
 
 int g_trace_after_dec = 0;
 
+// --- VI retrace source -----------------------------------------------------
+// One VI interrupt per retrace, at vi_target_hz() (NWII_VI_HZ, default 60).
+// Self-rescheduling one-shot instead of a fixed recurring event so GXDrawDone
+// can pull the next retrace forward (vi_request_retrace, below).
+static uint64_t s_vi_period = 0; // timebase ticks per retrace (0 = not started)
+static uint64_t s_vi_last = 0;   // timebase of the last retrace
+static uint64_t s_vi_due = 0;    // timebase the pending retrace fires at
+// First retrace after the previous frame end: the one that released the
+// game's VIWaitForRetrace. Retraces in the middle of a frame (nobody waits)
+// must not delay the next one.
+static uint64_t s_vi_frame_retrace = 0;
+static bool s_vi_frame_open = false; // frame ended, its retrace not fired yet
+// Recent frame work times (from the retrace that released a frame to that
+// frame's GXDrawDone), for the steady pacing below. Work, not the paced
+// period, or the pacing would feed on itself and never speed up again.
+static uint64_t s_vi_hist[32] = {};
+static unsigned s_vi_hist_n = 0;
+static nwii::runtime::EventScheduler::EventId s_vi_event = 0;
+
+// [graphics] frame_rate (live from the settings overlay); NWII_VI_HZ overrides.
+static int vi_target_hz() {
+    static const int env_hz = [] {
+        const char *e = std::getenv("NWII_VI_HZ");
+        return e && std::atoi(e) > 0 ? std::atoi(e) : 0;
+    }();
+    return env_hz ? env_hz : nwii::runtime::Config::get().frame_rate;
+}
+
+static void vi_fire(CPUContext &c, uint64_t);
+
+static void vi_schedule_at(uint64_t due) {
+    auto &es = nwii::runtime::EventScheduler::get();
+    if (s_vi_event) es.cancel(s_vi_event);
+    const uint64_t now = es.now();
+    s_vi_due = due;
+    s_vi_event = es.schedule_after(due > now ? due - now : 0, vi_fire);
+}
+
+uint64_t g_vi_fired_total = 0; // retraces so far (NWII_VISTAT)
+
+static void vi_fire(CPUContext &c, uint64_t) {
+    s_vi_event = 0;
+    s_vi_period = std::max<uint64_t>(1, c.tb_freq / vi_target_hz());
+    ++g_vi_fired_total;
+    s_vi_last = nwii::runtime::EventScheduler::get().now();
+    if (s_vi_frame_open) {
+        s_vi_frame_retrace = s_vi_last;
+        s_vi_frame_open = false;
+    }
+    const bool deliver =
+        (nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
+        !(nwii::runtime::hw::pi_intsr & 0x100) &&
+        (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0);
+    if (deliver)
+        nwii::runtime::hw::vi_trigger_interrupt();
+    // NWII_VISTAT=1: VI events fired vs delivered, every 5 s.
+    static const bool vistat = std::getenv("NWII_VISTAT") != nullptr;
+    if (vistat) {
+        static uint32_t fired = 0, delivered = 0, why_cb = 0, why_pending = 0, why_ctx = 0;
+        static auto t0 = std::chrono::steady_clock::now();
+        ++fired;
+        if (deliver) ++delivered;
+        else if (c.in_callback) ++why_cb;
+        else if (nwii::runtime::hw::pi_intsr & 0x100) ++why_pending;
+        else ++why_ctx;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - t0 >= std::chrono::seconds(5)) {
+            t0 = now;
+            std::printf("[VISTAT] fired=%u delivered=%u skipped: in_callback=%u "
+                        "still_pending=%u other=%u\n",
+                        fired, delivered, why_cb, why_pending, why_ctx);
+            fired = delivered = why_cb = why_pending = why_ctx = 0;
+        }
+    }
+    vi_schedule_at(s_vi_last + s_vi_period);
+}
+
+// Adaptive retrace (NWII_VI_ADAPTIVE=0 turns it off): called from the
+// GXDrawDone seam at the end of each game frame, right before the game's
+// VIFlush + VIWaitForRetrace. The next retrace then comes at
+// max(now + 0.3 ms, previous frame's retrace + period) instead of on a fixed
+// grid, so a
+// frame costs max(its work, one period) rather than a whole number of
+// periods (a 9 ms frame at 120 Hz took 16.7 ms; an 18 ms one at 60 took
+// 33). Safe for Spyro: it simulates on OS time, not retrace counts. The
+// 0.3 ms lets the game reach VIWaitForRetrace first, or it would wait for the
+// retrace after.
+void vi_request_retrace(CPUContext &ctx) {
+    static const bool adaptive = [] {
+        const char *e = std::getenv("NWII_VI_ADAPTIVE");
+        return !(e && e[0] == '0');
+    }();
+    // NWII_VISTAT: per frame, retraces since the previous frame end and the
+    // time from the last retrace to this frame end (the frame's work).
+    static const bool vistat = std::getenv("NWII_VISTAT") != nullptr;
+    if (vistat) {
+        static uint64_t frames = 0, work_tb = 0, last_count = 0, hist[5] = {};
+        extern uint64_t g_vi_fired_total;
+        const uint64_t now = ctx.read_timebase();
+        ++frames;
+        work_tb += now - s_vi_last;
+        ++hist[std::min<uint64_t>(4, g_vi_fired_total - last_count)];
+        last_count = g_vi_fired_total;
+        if (frames == 300) {
+            std::printf("[VIFRAME] avg work since last retrace %.2f ms | retraces per "
+                        "frame 0:%llu 1:%llu 2:%llu 3:%llu 4+:%llu\n",
+                        (double)work_tb / frames * 1000.0 / ctx.tb_freq,
+                        (unsigned long long)hist[0], (unsigned long long)hist[1],
+                        (unsigned long long)hist[2], (unsigned long long)hist[3],
+                        (unsigned long long)hist[4]);
+            frames = work_tb = 0;
+            std::fill(std::begin(hist), std::end(hist), 0);
+        }
+    }
+    if (!adaptive || s_vi_period == 0) return;
+    if (s_vi_frame_retrace && !s_vi_frame_open)
+        s_vi_hist[s_vi_hist_n++ % 32] = ctx.read_timebase() - s_vi_frame_retrace;
+    s_vi_frame_open = true;
+    // Steady pacing (NWII_VI_STEADY=0 off; only above 60 Hz): frame times at
+    // the 120 setting swing between ~8 and ~14 ms with the scene, and the
+    // swing itself reads as stutter while turning. The next frame starts no
+    // earlier than the 80th percentile of the last 32 frames' work -- a few
+    // fps less on average, evenly spaced.
+    static const bool steady = [] {
+        const char *e = std::getenv("NWII_VI_STEADY");
+        return !(e && e[0] == '0');
+    }();
+    uint64_t period = s_vi_period;
+    if (steady && vi_target_hz() > 60 && s_vi_hist_n >= 32) {
+        uint64_t v[32];
+        std::copy(std::begin(s_vi_hist), std::end(s_vi_hist), v);
+        std::nth_element(v, v + 25, v + 32);
+        period = std::clamp<uint64_t>(v[25], s_vi_period, ctx.tb_freq / 30);
+    }
+    const uint64_t soon = ctx.read_timebase() + ctx.tb_freq * 3 / 10000;
+    const uint64_t due = std::max(soon, s_vi_frame_retrace + period);
+    if (due < s_vi_due) vi_schedule_at(due);
+}
+
+void GX_WGPIPE_Flush(); // gx.cpp: gather-pipe staging -> FIFO
+
 bool process_pending_callbacks(CPUContext &ctx) {
+  GX_WGPIPE_Flush();
 
   
-  if (std::getenv("NWII_SAMPLE")) {
+  if (s_env_sample) {
       static uint32_t last_ee = 0, edges = 0;
       uint32_t ee = ctx.msr & 0x8000;
       if (ee && !last_ee && edges < 8)
@@ -827,7 +989,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
   }
 
   {
-    static bool sample = std::getenv("NWII_SAMPLE") != nullptr;
+    static bool sample = s_env_sample;
     static uint64_t n = 0;
     if (sample && (++n % 400000) == 0)
       std::cout << "[Sample] pc=0x" << std::hex << ctx.pc << " lr=0x" << ctx.lr
@@ -845,11 +1007,12 @@ bool process_pending_callbacks(CPUContext &ctx) {
     
     static uint32_t g_resched_addr = []() -> uint32_t {
       const char *e = std::getenv("NWII_RESCHED");
-      return e ? (uint32_t)std::strtoul(e, nullptr, 16) : 0;
+      return e ? (uint32_t)std::strtoul(e, nullptr, 16)
+               : nwii::runtime::Config::get().game_profile.resched_addr;
     }();
     if (ctx.ext_resched_pending && g_resched_addr) {
       ctx.ext_resched_pending = false;
-      if (std::getenv("NWII_SAMPLE")) {
+      if (s_env_sample) {
         static int n = 0;
         if (n++ < 12) {
           uint32_t cur = ctx.mmu.read32(0x800000E4);
@@ -881,7 +1044,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
       ctx.dec_written_tb = ctx.read_timebase();
       static uint32_t restore_count = 0;
       restore_count++;
-      if (ctx.pc == 0 || (restore_count % 64) == 1) {
+      if (nwii::runtime::g_verbose && (ctx.pc == 0 || (restore_count % 64) == 1)) {
           std::cout << "[HLE PI] Context restore #" << std::dec << restore_count
                     << " pc=0x" << std::hex << ctx.pc << " r1=0x" << ctx.gpr[1]
                     << " msr=0x" << ctx.msr << std::dec << "\n";
@@ -890,7 +1053,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
     }
   }
 
-  if ((ctx.inst_count % 20000000) == 0) {
+  if (nwii::runtime::g_verbose && (ctx.inst_count % 20000000) == 0) {
       std::cout << "[Heartbeat] PC: 0x" << std::hex << ctx.pc << " LR: 0x" << ctx.lr
                 << " intmr=0x" << nwii::runtime::hw::pi_intmr.load()
                 << " intsr=0x" << nwii::runtime::hw::pi_intsr.load()
@@ -958,7 +1121,10 @@ bool process_pending_callbacks(CPUContext &ctx) {
   
   if (ctx.pc == 0) {
       static uint64_t idle_hits = 0;
-      if (++idle_hits == 200000) {
+      static int idle_dumps = 0;
+      // Periodic (capped) while idle, so a stall later in the game shows
+      // which queue every thread is parked on.
+      if ((++idle_hits % 20000) == 0 && idle_dumps++ < 40) {
           std::cout << "[IDLE] no runnable thread. intmr=0x" << std::hex
                     << nwii::runtime::hw::pi_intmr << " intsr=0x"
                     << nwii::runtime::hw::pi_intsr << " dec_armed="
@@ -984,7 +1150,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
       g_ipc_interrupt_delay--;
       if (g_ipc_interrupt_delay == 0) {
           nwii::runtime::hw::trigger_pi_interrupt(0x00004000);
-          if (std::getenv("NWII_SAMPLE"))
+          if (s_env_sample)
               std::cout << "[IPC] irq raised intmr=0x" << std::hex
                         << nwii::runtime::hw::pi_intmr << " msr=0x" << ctx.msr
                         << " pc=0x" << ctx.pc << std::dec << "\n";
@@ -997,7 +1163,12 @@ bool process_pending_callbacks(CPUContext &ctx) {
   if (ctx.vblank_pending) {
       if (!ctx.in_callback && (ctx.msr & 0x8000)) {
           ctx.vblank_pending = false;
-          nwii::runtime::hw::vi_trigger_interrupt();
+          // With a wall timebase the 60 Hz scheduler event below is the VI
+          // source; raising it on every host present as well tripled the
+          // retrace rate, so VIWaitForRetrace barely slept and lower-priority
+          // threads (Spyro's streamer) never ran.
+          if (!nwii::runtime::g_wall_timebase)
+              nwii::runtime::hw::vi_trigger_interrupt();
 
           
           
@@ -1011,7 +1182,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
   }
 
   if (ctx.in_callback) {
-    if (std::getenv("NWII_SAMPLE") && (nwii::runtime::hw::pi_intsr & 0x4000)) {
+    if (s_env_sample && (nwii::runtime::hw::pi_intsr & 0x4000)) {
         static uint64_t n = 0;
         if ((n++ % 100000) == 0)
             std::cout << "[IPC] irq pending but in_callback pc=0x" << std::hex
@@ -1033,33 +1204,25 @@ bool process_pending_callbacks(CPUContext &ctx) {
 
   
   
-  {
-      static bool vi_registered = false;
-      if (!vi_registered) {
-          vi_registered = true;
-
-          
-          uint64_t vi_period = ctx.tb_freq / 60;
-          if (vi_period == 0) vi_period = 500000;
-          nwii::runtime::EventScheduler::get().schedule_recurring(
-              vi_period, [](CPUContext& c, uint64_t) {
-
-                  
-                  
-                  if ((nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
-                      !(nwii::runtime::hw::pi_intsr & 0x100) &&
-                      (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0)) {
-                      nwii::runtime::hw::vi_trigger_interrupt();
-                  }
-              });
-      }
-      nwii::runtime::EventScheduler::get().advance(ctx, ctx.read_timebase());
+  if (s_vi_period == 0) {
+      s_vi_period = ctx.tb_freq / vi_target_hz();
+      if (s_vi_period == 0) s_vi_period = 500000;
+      vi_schedule_at(EventScheduler::get().now() + s_vi_period);
   }
+  // One wall-clock read shared by the scheduler and the decrementer.
+  static uint32_t s_tb_tick = 0;
+  static uint64_t s_tb_now = 0;
+  // (Back-edges already call in only every 16th time, see poll_callbacks.)
+  (void)s_tb_tick;
+  s_tb_now = ctx.read_timebase();
+  nwii::runtime::EventScheduler::get().advance(ctx, s_tb_now);
 
   
-  if (ctx.dec_expired() && (ctx.msr & 0x8000) && !ctx.in_callback) {
+  if (ctx.dec_irq_pending && s_tb_now >= ctx.dec_written_tb &&
+      (s_tb_now - ctx.dec_written_tb) >= ctx.dec_value &&
+      (ctx.msr & 0x8000) && !ctx.in_callback) {
       ctx.dec_irq_pending = false; 
-      if (std::getenv("NWII_SAMPLE")) {
+      if (s_env_sample) {
           static uint32_t df = 0;
           if (df++ < 12)
               std::cout << "[DECfire] #" << df << " pc=0x" << std::hex << ctx.pc
@@ -1132,7 +1295,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
               
 
               if (wq >= 0x80000000u && wq < 0x81800000u &&
-                  std::getenv("NWII_SAMPLE")) {
+                  s_env_sample) {
                   std::cout << "    wq[-2..5]:" << std::hex;
                   for (int i = -2; i < 6; ++i)
                       std::cout << " " << ctx.mmu.read32(wq + i * 4);
@@ -1199,7 +1362,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
 
       if (use_new_path && (handler_in_flight || (!idle && sched_disabled))) {
           
-          if (std::getenv("NWII_SAMPLE")) {
+          if (s_env_sample) {
               static uint64_t defer_count = 0;
               if ((++defer_count % 500000) == 0)
                   std::cout << "[HLE PI] int deferred: sched_disabled="
@@ -1266,7 +1429,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
               ctx.lr = 0xFFFFFFFC;
               ctx.pc = s_dispatch_addr;
 
-              if (std::getenv("NWII_SAMPLE")) {
+              if (s_env_sample) {
                   static uint32_t dc = 0;
                   if ((dc++ % 1000) == 0)
                       std::cout << "[HLE PI] -> __OSDispatchInterrupt #" << std::dec
@@ -1287,7 +1450,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
               else if (active_ints & 0x00000100) { os_intr = 24; bit_to_clear = 0x00000100; } 
               else if (active_ints & 0x00000004) { os_intr = 21; bit_to_clear = 0x00000004; } 
               else if (active_ints & 0x00000008) { os_intr = 20; bit_to_clear = 0x00000008; } 
-              else if (active_ints & 0x00000010) { os_intr =  9; bit_to_clear = 0x00000010; } 
+              else if (active_ints & 0x00000010) { os_intr = nwii::runtime::hw::exi_pending_os_interrupt(); bit_to_clear = 0x00000010; } 
 
               else if (active_ints & 0x00000040) { os_intr = nwii::runtime::hw::dsp_pending_os_interrupt(); bit_to_clear = 0x00000040; } 
               else if (active_ints & 0x00000020) { os_intr =  8; bit_to_clear = 0x00000020; } 
@@ -1299,7 +1462,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
                   uint32_t handler = ctx.mmu.read32(0x80003040 + os_intr * 4);
 
                   if (handler != 0 && handler != 0xFFFFFFFF) {
-                      if (std::getenv("NWII_SAMPLE") && os_intr == 24) {
+                      if (s_env_sample && os_intr == 24) {
                           static int vn = 0;
                           if (vn++ < 5)
                               std::cout << "[VIdisp] #" << vn << " handler=0x"
@@ -1308,14 +1471,14 @@ bool process_pending_callbacks(CPUContext &ctx) {
                       }
                       
                       static uint32_t vi_dispatch_count = 0;
-                      if (os_intr != 24 && (vi_dispatch_count++ % 256) == 0) {
+                      if (nwii::runtime::g_verbose && os_intr != 24 && (vi_dispatch_count++ % 256) == 0) {
                           std::cout << "[HLE PI] Dispatching interrupt "
                                     << std::dec << os_intr << " to handler 0x"
                                     << std::hex << handler << " r1=0x"
                                     << ctx.gpr[1] << " pc=0x" << ctx.pc
                                     << std::dec << std::endl;
                       }
-                      if (std::getenv("NWII_SAMPLE")) {
+                      if (s_env_sample) {
                           static uint64_t census[32] = {0};
                           static uint64_t total = 0;
                           if (os_intr >= 0 && os_intr < 32) census[os_intr]++;
@@ -1331,7 +1494,7 @@ bool process_pending_callbacks(CPUContext &ctx) {
                       uint32_t current_ctx = ctx.mmu.read32(0x800000D4);
                       if (current_ctx == 0) {
                           
-                          if (std::getenv("NWII_SAMPLE")) {
+                          if (s_env_sample) {
                               static int n = 0;
                               if (n++ < 4)
                                   std::cout << "[HLE PI] int " << std::dec

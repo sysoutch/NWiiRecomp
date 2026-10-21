@@ -4,6 +4,11 @@
 #include <deque>
 #include <iostream>
 #include <vector>
+#include <cstdlib>
+
+// Cached: std::getenv takes a lock and scans the environment, and these
+// checks sit on the per-branch interrupt-poll path.
+static const bool s_env_sample = std::getenv("NWII_SAMPLE") != nullptr;
 
 namespace nwii::runtime::devices {
 
@@ -140,7 +145,7 @@ private:
         uint32_t n = (uint32_t)evt.size() < len ? (uint32_t)evt.size() : len;
         for (uint32_t i = 0; i < n; ++i)
             ctx.mmu.write8(p + i, evt[i]);
-        if (std::getenv("NWII_SAMPLE")) {
+        if (s_env_sample) {
             std::cout << "[USB] event -> 0x" << std::hex << p << " len=" << std::dec
                       << n << " bytes:";
             for (uint32_t i = 0; i < n && i < 8; ++i)

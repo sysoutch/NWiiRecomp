@@ -1,10 +1,15 @@
 #include "runtime/cpu_context.h"
 #include <iostream>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <bit>
 #include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <algorithm>
+#include <vector>
 
 
 
@@ -240,14 +245,52 @@ bool interpret_one(CPUContext& ctx) {
             set_crf(ctx, rD >> 2, a < b, a > b, a == b);
             break;
         }
-        case 266: ctx.gpr[rD] = ctx.gpr[rA] + ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]); break; 
+        case 266: ctx.gpr[rD] = ctx.gpr[rA] + ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]); break;
+        // Carrying forms: rD = a + b + c with CA = carry out of bit 0.
+        case 10: case 138: case 202: case 234:   // addc, adde, addze, addme
+        case 8:  case 136: case 200: case 232: { // subfc, subfe, subfze, subfme
+            const bool sub = xo == 8 || xo == 136 || xo == 200 || xo == 232;
+            const uint64_t a = sub ? (uint32_t)~ctx.gpr[rA] : ctx.gpr[rA];
+            const uint64_t ca = (ctx.xer >> 29) & 1;
+            uint64_t b, c;
+            switch (xo) {
+            case 10:  b = ctx.gpr[rB]; c = 0; break;
+            case 8:   b = ctx.gpr[rB]; c = 1; break;
+            case 138: case 136: b = ctx.gpr[rB]; c = ca; break;
+            case 202: case 200: b = 0; c = ca; break;
+            default:  b = 0xFFFFFFFFu; c = ca; break; // addme, subfme
+            }
+            const uint64_t res = a + b + c;
+            ctx.gpr[rD] = (uint32_t)res;
+            ctx.xer = (ctx.xer & ~0x20000000u) | ((uint32_t)(res >> 32) & 1) << 29;
+            if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]);
+            break;
+        }
         case 40:  ctx.gpr[rD] = ctx.gpr[rB] - ctx.gpr[rA]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]); break; 
         case 104: ctx.gpr[rD] = -(int32_t)ctx.gpr[rA]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]); break; 
         case 235: ctx.gpr[rD] = (int32_t)ctx.gpr[rA] * (int32_t)ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]); break; 
         case 75:  ctx.gpr[rD] = (uint32_t)(((int64_t)(int32_t)ctx.gpr[rA] * (int32_t)ctx.gpr[rB]) >> 32); break; 
         case 11:  ctx.gpr[rD] = (uint32_t)(((uint64_t)ctx.gpr[rA] * ctx.gpr[rB]) >> 32); break; 
-        case 491: ctx.gpr[rD] = ctx.gpr[rB] ? (uint32_t)((int32_t)ctx.gpr[rA] / (int32_t)ctx.gpr[rB]) : 0; break; 
-        case 459: ctx.gpr[rD] = ctx.gpr[rB] ? ctx.gpr[rA] / ctx.gpr[rB] : 0; break; 
+        // Divide by zero / INT_MIN/-1: Gekko (per Dolphin) gives 0 for divwu
+        // and the dividend's sign (0 or -1) for divw.
+        case 491: {
+            const int32_t a = (int32_t)ctx.gpr[rA], b = (int32_t)ctx.gpr[rB];
+            ctx.gpr[rD] = (b == 0 || (a == INT32_MIN && b == -1)) ? (a < 0 ? 0xFFFFFFFFu : 0u)
+                                                                 : (uint32_t)(a / b);
+            if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]);
+            break;
+        }
+        case 459:
+            ctx.gpr[rD] = ctx.gpr[rB] ? ctx.gpr[rA] / ctx.gpr[rB] : 0;
+            if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rD]);
+            break;
+        case 183: { // stwux
+            const uint32_t ea = ctx.gpr[rA] + ctx.gpr[rB];
+            ctx.mmu.write32(ea, ctx.gpr[rD]);
+            ctx.gpr[rA] = ea;
+            break;
+        }
+        case 210: case 595: break; // mtsr / mfsr: segment registers unused
         case 28:  ctx.gpr[rA] = ctx.gpr[rD] & ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rA]); break; 
         case 60:  ctx.gpr[rA] = ctx.gpr[rD] & ~ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rA]); break; 
         case 444: ctx.gpr[rA] = ctx.gpr[rD] | ctx.gpr[rB]; if (rc) set_cr0(ctx, (int32_t)ctx.gpr[rA]); break; 
@@ -377,8 +420,8 @@ bool interpret_one(CPUContext& ctx) {
             break;
         }
         
-        case 535: ctx.fpr[rD] = ctx.mmu.read_f32(ea_ra0(0) + ctx.gpr[rB]); break; 
-        case 567: { uint32_t ea = ctx.gpr[rA] + ctx.gpr[rB]; ctx.fpr[rD] = ctx.mmu.read_f32(ea); ctx.gpr[rA] = ea; break; } 
+        case 535: ctx.fpr[rD] = ctx.ps1[rD] = ctx.mmu.read_f32(ea_ra0(0) + ctx.gpr[rB]); break; 
+        case 567: { uint32_t ea = ctx.gpr[rA] + ctx.gpr[rB]; ctx.fpr[rD] = ctx.ps1[rD] = ctx.mmu.read_f32(ea); ctx.gpr[rA] = ea; break; } 
         case 599: ctx.fpr[rD] = ctx.mmu.read_f64(ea_ra0(0) + ctx.gpr[rB]); break; 
         case 631: { uint32_t ea = ctx.gpr[rA] + ctx.gpr[rB]; ctx.fpr[rD] = ctx.mmu.read_f64(ea); ctx.gpr[rA] = ea; break; } 
         case 663: ctx.mmu.write_f32(ea_ra0(0) + ctx.gpr[rB], (float)ctx.fpr[rD]); break; 
@@ -426,7 +469,7 @@ bool interpret_one(CPUContext& ctx) {
     case 48: ctx.fpr[rD] = ctx.ps1[rD] = ctx.mmu.read_f32(ea_ra0(simm)); break; 
     case 49: { 
         uint32_t ea = ctx.gpr[rA] + simm;
-        ctx.fpr[rD] = ctx.mmu.read_f32(ea);
+        ctx.fpr[rD] = ctx.ps1[rD] = ctx.mmu.read_f32(ea);
         ctx.gpr[rA] = ea;
         break;
     }
@@ -482,6 +525,7 @@ bool interpret_one(CPUContext& ctx) {
                       << std::hex << pc << std::dec << " (nop)\n";
             break;
         }
+        ctx.ps1[rD] = ctx.fpr[rD];  // single results fill both PS slots
         break;
     }
     case 63: { 
@@ -516,14 +560,14 @@ bool interpret_one(CPUContext& ctx) {
             ctx.cr[crf].so = un;
             break;
         }
-        case 12: ctx.fpr[rD] = (float)b; break;                        
+        case 12: ctx.fpr[rD] = ctx.ps1[rD] = (float)b; break;                        
         case 14: { 
-            uint64_t bits = (uint32_t)(int32_t)std::nearbyint(b);
+            uint64_t bits = ppc_cvt_s32(std::nearbyint(b));
             std::memcpy(&ctx.fpr[rD], &bits, 8);
             break;
         }
         case 15: { 
-            uint64_t bits = (uint32_t)(int32_t)b;
+            uint64_t bits = ppc_cvt_s32(std::trunc(b));
             std::memcpy(&ctx.fpr[rD], &bits, 8);
             break;
         }
@@ -666,10 +710,30 @@ static bool try_native_helper(CPUContext& ctx) {
 
 
 void interpret_step(CPUContext& ctx) {
+    // NWII_INTERP_STAT=1: interpreted instructions per 5 s and the hottest
+    // pcs -- compiled code that is entered at an address its (lean) entry
+    // switch does not list ends up here.
+    static const bool istat = std::getenv("NWII_INTERP_STAT") != nullptr;
+    if (istat) {
+        static std::unordered_map<uint32_t, uint32_t> hits;
+        static uint64_t total = 0;
+        static auto t0 = std::chrono::steady_clock::now();
+        ++hits[ctx.pc];
+        ++total;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - t0 >= std::chrono::seconds(5)) {
+            t0 = now;
+            std::vector<std::pair<uint32_t, uint32_t>> v(hits.begin(), hits.end());
+            std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second > b.second; });
+            std::printf("[INTERP] %llu steps / 5 s:", (unsigned long long)total);
+            for (size_t i = 0; i < v.size() && i < 8; ++i)
+                std::printf(" %08X=%u", v[i].first, v[i].second);
+            std::printf("\n");
+            hits.clear();
+            total = 0;
+        }
+    }
 
-    
-
-    
     static const bool relcap = std::getenv("NWII_RELCAP") != nullptr;
     if (relcap) {
         static bool done = false;
@@ -773,6 +837,123 @@ void interpret_step(CPUContext& ctx) {
     }
     std::cout << "[Interp] Budget exceeded at 0x" << std::hex << ctx.pc
               << std::dec << "\n";
+}
+
+volatile bool g_interp_mode = false;
+
+static std::unordered_map<uint32_t, void (*)(CPUContext&)> &native_funcs() {
+    static std::unordered_map<uint32_t, void (*)(CPUContext&)> m;
+    return m;
+}
+
+void register_native_func(uint32_t addr, void (*fn)(CPUContext&)) {
+    native_funcs()[addr] = fn;
+}
+
+volatile uint32_t g_interp_limit = 0xFFFFFFFFu;
+
+static std::unordered_map<uint32_t, void (*)(CPUContext&)> &compiled_funcs() {
+    static std::unordered_map<uint32_t, void (*)(CPUContext&)> m;
+    return m;
+}
+
+void register_compiled_func(uint32_t addr, void (*fn)(CPUContext&)) {
+    compiled_funcs()[addr] = fn;
+}
+
+// Indirect calls (bctrl: every C++ virtual call) used to return all the way
+// to run_game, which re-dispatched the target and later the return address
+// through its big switch. call_indirect() calls the compiled function for
+// ctx.pc in place instead, like a direct bl; false = not a known entry, take
+// the old route. A flat table over MEM1 code makes the lookup O(1).
+bool call_indirect(CPUContext& ctx) {
+    // NWII_NO_DIRECT_CALLS=1: old behaviour (every bctrl via the dispatcher).
+    static const bool off = std::getenv("NWII_NO_DIRECT_CALLS") != nullptr;
+    if (off) return false;
+    static std::vector<void (*)(CPUContext&)> table;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        uint32_t max_addr = 0x80000000u;
+        for (const auto &[addr, fn] : compiled_funcs())
+            if (addr >= 0x80000000u && addr < 0x81800000u) max_addr = std::max(max_addr, addr);
+        table.assign(((max_addr - 0x80000000u) >> 2) + 1, nullptr);
+        for (const auto &[addr, fn] : compiled_funcs())
+            if (addr >= 0x80000000u && addr <= max_addr && !(addr & 3))
+                table[(addr - 0x80000000u) >> 2] = fn;
+        for (const auto &[addr, fn] : native_funcs()) // HLE-bound entries win
+            if (addr >= 0x80000000u && addr <= max_addr && !(addr & 3))
+                table[(addr - 0x80000000u) >> 2] = fn;
+    }
+    const uint32_t idx = (ctx.pc - 0x80000000u) >> 2;
+    if (ctx.pc < 0x80000000u || (ctx.pc & 3) || idx >= table.size() || !table[idx])
+        return false;
+    table[idx](ctx);
+    return true;
+}
+
+// (native entry address, guest address) of every compiled function, for the
+// native profiler (native_prof.cpp).
+std::vector<std::pair<uintptr_t, uint32_t>> compiled_func_natives() {
+    std::vector<std::pair<uintptr_t, uint32_t>> v;
+    v.reserve(compiled_funcs().size());
+    for (const auto &[addr, fn] : compiled_funcs()) v.push_back({(uintptr_t)fn, addr});
+    return v;
+}
+
+// Interpret the function that ctx.pc is in (from its entry or from a resume
+// point) until it returns to its caller: calls are tracked by depth, native
+// handlers stand in for HLE-bound functions, and pending callbacks are taken
+// as often as compiled loops would. Returns with ctx.pc at the return
+// address, or wherever an interrupt/rfi redirected execution.
+void interp_run(CPUContext& ctx) {
+    int depth = 0;
+    uint64_t n = 0;
+    while (ctx.is_running && ctx.pc != 0) {
+        const uint32_t before = ctx.pc;
+        void (*native)(CPUContext&) = nullptr;
+        if (auto it = native_funcs().find(before); it != native_funcs().end())
+            native = it->second;
+        else if (before >= g_interp_limit)
+            if (auto c = compiled_funcs().find(before); c != compiled_funcs().end())
+                native = c->second;
+        if (native) {
+            // An HLE handler, or a compiled function above the limit. It
+            // returns with ctx.pc == ctx.lr; anything else (an interrupt, an
+            // indirect call handed to the dispatcher) unwinds us too -- the
+            // guest stack holds everything needed to resume.
+            const uint32_t ret = ctx.lr;
+            // NWII_SDKLOG=1: log game->SDK/HLE calls (address, args, result).
+            static const bool sdklog = std::getenv("NWII_SDKLOG") != nullptr;
+            const uint32_t a3 = ctx.gpr[3], a4 = ctx.gpr[4], a5 = ctx.gpr[5];
+            const double f1 = ctx.fpr[1];
+            native(ctx);
+            if (sdklog)
+                std::printf("[SDK] %08X from %08X r3=%08X r4=%08X r5=%08X f1=%g -> r3=%08X r4=%08X f1=%g\n",
+                            before, ret, a3, a4, a5, f1, ctx.gpr[3], ctx.gpr[4], ctx.fpr[1]);
+            if (ctx.pc != ret || depth == 0) return;
+            --depth;
+            continue;
+        }
+        const uint32_t insn = ctx.mmu.read32(before);
+        const uint32_t op = insn >> 26, xo = (insn >> 1) & 0x3FF;
+        const bool lk = insn & 1;
+        const uint32_t ee_was = ctx.msr & 0x8000;
+        interpret_one(ctx);
+        ++ctx.inst_count;
+        if (!ee_was && (ctx.msr & 0x8000) && process_pending_callbacks(ctx))
+            return;
+        const bool taken = ctx.pc != before + 4;
+        if (op == 19 && xo == 50) return; // rfi
+        if (taken && lk && (op == 16 || op == 18 || (op == 19 && (xo == 16 || xo == 528)))) {
+            ++depth;
+        } else if (taken && !lk && op == 19 && xo == 16) {
+            if (depth == 0) return;
+            --depth;
+        }
+        if ((++n & 0x3FF) == 0 && process_pending_callbacks(ctx))
+            return;
+    }
 }
 
 void micro_interpret(CPUContext& ctx, uint32_t opcode, uint32_t pc) {

@@ -44,6 +44,9 @@ bool VirtualDisc::init(const std::string& game_dir) {
     m_dir = game_dir;
 
     fs::path root(game_dir);
+    std::error_code ec;
+    if (fs::is_regular_file(root, ec))
+        return m_valid = init_image(game_dir);
     fs::path sys = root / "sys";
     if (!fs::exists(sys / "fst.bin") || !fs::exists(sys / "boot.bin")) {
         
@@ -91,6 +94,33 @@ bool VirtualDisc::init(const std::string& game_dir) {
     std::cout << "[VDisc] Extracted disc: " << (m_is_wii ? "Wii" : "GC")
               << ", " << m_regions.size() << " regions, FST "
               << m_fst_data.size() << " bytes" << std::endl;
+    return true;
+}
+
+// A GameCube disc image (.iso/.gcm or RVZ): reads go through DiscImage;
+// boot.bin and the FST are read out of it.
+bool VirtualDisc::init_image(const std::string& image) {
+    std::string why;
+    auto img = DiscImage::open(image, &why);
+    if (!img) {
+        std::cout << "[VDisc] " << image << ": " << why << std::endl;
+        return false;
+    }
+    std::vector<uint8_t> boot(0x440);
+    if (!img->read(0, (uint32_t)boot.size(), boot.data()))
+        return false;
+    const uint32_t fst_off = be32(&boot[0x424]), fst_size = be32(&boot[0x428]);
+    std::vector<uint8_t> fst(fst_size);
+    if (!fst_size || !img->read(fst_off, fst_size, fst.data())) {
+        std::cout << "[VDisc] disc image has no readable FST: " << image << std::endl;
+        return false;
+    }
+    m_boot_data = std::move(boot);
+    m_fst_data = std::move(fst);
+    m_is_wii = false;
+    m_image = std::move(img);
+    std::cout << "[VDisc] Disc image: GC, FST " << m_fst_data.size() << " bytes ("
+              << image << ")" << std::endl;
     return true;
 }
 
@@ -143,6 +173,8 @@ void VirtualDisc::parse_fst() {
 size_t VirtualDisc::read(uint64_t offset, uint32_t len, uint8_t* dst) {
     if (!m_valid)
         return 0;
+    if (m_image)
+        return m_image->read(offset, len, dst) ? len : 0;
     std::memset(dst, 0, len);
 
     uint64_t end = offset + len;

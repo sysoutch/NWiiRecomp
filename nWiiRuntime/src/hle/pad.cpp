@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "runtime/cpu_context.h"
 #include "input/input_manager.h"
 
@@ -25,6 +27,22 @@ void PADRead(CPUContext& ctx) {
     ctx.mmu.write8(pad_status_array_addr + 9, state.buttons & 0x0200 ? 0xFF : 0);
     ctx.mmu.write8(pad_status_array_addr + 10, state.err);
     ctx.mmu.write8(pad_status_array_addr + 11, 0);
+
+    // NWII_PADLOG=1: print pad 0 whenever what the game sees changes.
+    static const bool padlog = std::getenv("NWII_PADLOG") != nullptr;
+    if (padlog) {
+        static uint64_t last = ~0ull;
+        const uint64_t cur = (uint64_t)state.buttons | (uint64_t)(uint8_t)state.stick_x << 16 |
+                             (uint64_t)(uint8_t)state.stick_y << 24 | (uint64_t)(uint8_t)state.substick_x << 32 |
+                             (uint64_t)(uint8_t)state.substick_y << 40 | (uint64_t)state.trigger_l << 48 |
+                             (uint64_t)state.trigger_r << 56;
+        if (cur != last || last == ~0ull) {
+            std::printf("[PAD] buttons=%04x stick=%d,%d c=%d,%d trig=%u,%u err=%d\n", state.buttons,
+                        state.stick_x, state.stick_y, state.substick_x, state.substick_y,
+                        state.trigger_l, state.trigger_r, state.err);
+            last = cur;
+        }
+    }
 
     for (int i = 1; i < 4; i++) {
         uint32_t offset = pad_status_array_addr + (i * 12);

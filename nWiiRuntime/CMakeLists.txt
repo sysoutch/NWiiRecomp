@@ -22,8 +22,51 @@ else()
     FetchContent_MakeAvailable(glad)
 endif()
 
+# zstd, decompression only, for RVZ disc images (Dolphin's compressed format).
+# Built from its sources here; SOURCE_SUBDIR keeps its own CMake project out.
+FetchContent_Declare(nwii_zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  build/none
+)
+FetchContent_MakeAvailable(nwii_zstd)
+file(GLOB NWII_ZSTD_SRC
+    ${nwii_zstd_SOURCE_DIR}/lib/common/*.c
+    ${nwii_zstd_SOURCE_DIR}/lib/decompress/*.c
+)
+add_library(nwii_zstd STATIC ${NWII_ZSTD_SRC})
+target_include_directories(nwii_zstd PUBLIC ${nwii_zstd_SOURCE_DIR}/lib)
+target_compile_definitions(nwii_zstd PRIVATE ZSTD_DISABLE_ASM)
+
+# Dear ImGui for the in-game settings overlay (F1). The repo has no CMake
+# build, so its sources and the SDL2 + OpenGL3 backends are compiled here.
+FetchContent_Declare(nwii_imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.5
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nwii_imgui)
+add_library(nwii_imgui STATIC
+    ${nwii_imgui_SOURCE_DIR}/imgui.cpp
+    ${nwii_imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${nwii_imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${nwii_imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${nwii_imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    ${nwii_imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(nwii_imgui PUBLIC ${nwii_imgui_SOURCE_DIR} ${nwii_imgui_SOURCE_DIR}/backends)
+target_link_libraries(nwii_imgui PUBLIC SDL2-static)
+
 add_library(nwiiruntime STATIC
     src/core/loader.cpp
+    src/core/settings_overlay.cpp
+    src/core/ui_theme.cpp
+    src/core/launcher.cpp
+    src/hle/disc_image.cpp
+    src/core/native_prof.cpp
+    src/core/dispatch.cpp
+    src/input/key_bindings.cpp
     src/core/config.cpp
     src/core/os_hle_stubs.cpp
     src/core/event_scheduler.cpp
@@ -32,6 +75,7 @@ add_library(nwiiruntime STATIC
     src/input/sources/gamepad_source.cpp
     src/input/sources/phone_source.cpp
     src/hle/memory.cpp
+    src/hle/memops.cpp
     src/hle/gx.cpp
     src/hle/pad.cpp
     src/hle/dvd.cpp
@@ -55,8 +99,10 @@ add_library(nwiiruntime STATIC
     src/hw/hw_pe.cpp
     src/hw/hw_vi.cpp
     src/hw/hw_dsp.cpp
+    src/hw/hw_ax.cpp
     src/hw/hw_ai.cpp
     src/hw/hw_di.cpp
+    src/hw/hw_exi.cpp
     src/hw/hw_ipc.cpp
     src/hw/hw_all.cpp
     src/hw/hw_cp.cpp
@@ -68,7 +114,16 @@ add_library(nwiiruntime STATIC
     src/hle/interpreter.cpp
 )
 
-target_link_libraries(nwiiruntime PUBLIC SDL2-static tomlplusplus::tomlplusplus glad)
+target_link_libraries(nwiiruntime PUBLIC SDL2-static tomlplusplus::tomlplusplus glad nwii_imgui)
+target_link_libraries(nwiiruntime PRIVATE nwii_zstd)
+
+# Game-specific natives for [hle_hooks] that a game project generates at build
+# time (e.g. from the game's own code) into <project>/natives/. Empty when
+# building NWiiRecomp itself.
+file(GLOB NWII_GAME_NATIVES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/natives/*.cpp)
+target_sources(nwiiruntime PRIVATE ${NWII_GAME_NATIVES})
+# SDL2 would otherwise rename main() to SDL_main on Windows without SDL2main linked.
+target_compile_definitions(nwiiruntime PUBLIC SDL_MAIN_HANDLED)
 
 if(APPLE)
     find_library(COCOA_LIBRARY Cocoa)

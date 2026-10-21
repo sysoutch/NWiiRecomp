@@ -1,8 +1,10 @@
 #include "recompiler/recompiler.h"
 #include "ppc/instruction.h"
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <iostream>
 #include <sstream>
 #include <unordered_set>
@@ -31,18 +33,21 @@ static const std::unordered_set<std::string> &hle_handlers() {
   // GXLoadTexMtxImm and GXCallDisplayList are deliberately absent: both are
   // implemented but broke rendering in Mario Party 7, so they stay opt-in via
   // the TOML until that is understood.
+  //
+  // GX state setters whose value the SDK also caches in __GXData (zmode,
+  // cmode0/1, genMode, peCntrl, matIdxA) are NOT bound: the native versions
+  // only write the register, so the SDK's later "restore from cache" --
+  // GXCopyDisp/GXCopyTex put Z mode and blend state back after a clearing
+  // copy -- wrote stale values. In Spyro every EFB copy reset Z mode to 0 and
+  // the whole world drew without depth. The game's own setters write the same
+  // FIFO commands and keep the cache coherent. (GXSetZMode, GXSetBlendMode,
+  // GXSetZCompLoc, GXSetDstAlpha, GXSetCullMode, GXSetNumTevStages,
+  // GXSetCurrentMtx remain available through [hle_hooks].)
   static const std::unordered_set<std::string> s = {
       "GXLoadNrmMtxImm",
       "GXLoadPosMtxImm",
       "GXSetAlphaCompare",
-      "GXSetBlendMode",
-      "GXSetCullMode",
-      "GXSetCurrentMtx",
-      "GXSetDstAlpha",
-      "GXSetNumTevStages",
       "GXSetScissor",
-      "GXSetZCompLoc",
-      "GXSetZMode",
       "OSAllocFromHeap",
       "OSCreateHeap",
       "OSFreeToHeap",
@@ -50,7 +55,11 @@ static const std::unordered_set<std::string> &hle_handlers() {
       "OSReport",
       "PADInit",
       "PADRead",
-      "VIWaitForRetrace",
+      // VIWaitForRetrace is deliberately absent: the native stub returned
+      // at once instead of sleeping the thread until the next retrace, so
+      // the main loop never yielded -- frames ran unthrottled and lower-
+      // priority threads starved (Spyro's chunk streamer never finished the
+      // title load). The game's own SDK routine sleeps on the VI queue.
   };
   return s;
 }
@@ -80,9 +89,20 @@ static bool is_hle_function(const std::string &name) {
   return hle_handlers().count(bare_symbol(name)) != 0;
 }
 
+// The analyzer's built-in prologue signatures (signature_scanner.cpp) are
+// loose; the IOS_* ones are plain function prologues. A GameCube game has no
+// IOS, so such a match is always a false positive -- in Spyro it replaced a
+// game function at 0x80134F60 with the Wii IOS_IoctlvAsync stub.
+static bool g_gamecube = false;
+static bool sig_hooked(const analyzer::Function &func) {
+  if (func.hle_hook_name.empty()) return false;
+  return !(g_gamecube && func.hle_hook_name.rfind("IOS_", 0) == 0);
+}
+
 
 std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
   std::vector<std::string> generated_files;
+  g_gamecube = config_.gamecube;
 
   std::cout << "[Recompiler] Starting C++ generation. Total functions to emit: "
             << analyzer_.get_functions().size() << "\n";
@@ -101,12 +121,111 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     out << "using namespace nwii::runtime;\n\n";
   };
 
+  // Dispatch tables for main_output.cpp / output.cpp: every resumable guest
+  // address (function entries, call return addresses, loop heads, jump-table
+  // targets) -> its compiled function, plus function bounds and the native
+  // handlers. The dispatcher loop itself lives in the runtime (dispatch.cpp);
+  // emitting it as a ~46k-case switch made this the slowest file to build.
+  auto emit_dispatch = [&](std::ostream &out,
+                           const std::vector<std::string> &all_func_names,
+                           const std::vector<std::string> &all_base_names) {
+    out << "// --- Function Bounds Table ---\n";
+    out << "static const nwii::runtime::FuncBound g_func_bounds[] = {\n";
+    size_t func_idx = 0;
+    size_t num_bounds = 0;
+    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
+      const std::string &func_name = all_func_names[func_idx];
+      const bool is_hle = sig_hooked(func) ||
+                          is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
+      if (!is_hle) {
+        out << "    {0x" << std::hex << std::uppercase << start_addr << ", 0x"
+            << func.end_address << std::dec << ", " << func_name << "},\n";
+        ++num_bounds;
+      }
+    }
+    out << "    {0, 0, nullptr}\n";
+    out << "};\n\n";
+
+    // Native handlers bound to guest addresses, for the interpreter mode.
+    out << "// --- Native (HLE) functions ---\n";
+    out << "static const nwii::runtime::NativeFunc g_native_funcs[] = {\n";
+    func_idx = 0;
+    size_t num_natives = 0;
+    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
+      const std::string &fname = all_func_names[func_idx];
+      const bool is_hle = sig_hooked(func) ||
+                          is_hle_function(all_base_names[func_idx]) ||
+                          config_.hle_hooks.count(start_addr);
+      ++func_idx;
+      if (is_hle) {
+        out << "    {0x" << std::hex << std::uppercase << start_addr << std::dec
+            << ", " << fname << "},\n";
+        ++num_natives;
+      }
+    }
+    out << "    {0, nullptr}\n};\n\n";
+
+    // The first function that claims an address keeps it.
+    std::map<uint32_t, std::pair<std::string, bool>> entries; // addr -> (fn, hle)
+    func_idx = 0;
+    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
+      const std::string &func_name = all_func_names[func_idx];
+      const bool is_hle = sig_hooked(func) ||
+                          is_hle_function(all_base_names[func_idx]);
+      ++func_idx;
+      if (is_hle) {
+        entries.emplace(start_addr,
+                        std::make_pair(sig_hooked(func) ? func.hle_hook_name
+                                                        : func_name,
+                                       true));
+        continue;
+      }
+      entries.emplace(start_addr, std::make_pair(func_name, false));
+      for (const auto &inst : func.instructions) {
+        ppc::Instruction ppc_inst(inst.opcode);
+        if (ppc_inst.is_branch_link() || ppc_inst.opcode() == 17)
+          entries.emplace(inst.address + 4, std::make_pair(func_name, false));
+        if (ppc_inst.opcode() == 16 || ppc_inst.opcode() == 18) {
+          uint32_t target = ppc_inst.branch_target(inst.address);
+          bool is_local =
+              std::find_if(func.instructions.begin(), func.instructions.end(),
+                           [target](const auto &i) {
+                             return i.address == target;
+                           }) != func.instructions.end();
+          if (target <= inst.address && is_local)
+            entries.emplace(inst.address, std::make_pair(func_name, false));
+        }
+      }
+      for (uint32_t jump_target : func.jump_table_targets)
+        entries.emplace(jump_target, std::make_pair(func_name, false));
+    }
+    out << "// --- Dispatch entries (sorted) ---\n";
+    out << "static const nwii::runtime::DispatchEntry g_dispatch[] = {\n";
+    for (const auto &[addr, e] : entries)
+      out << "    {0x" << std::hex << std::uppercase << addr << std::dec
+          << (e.second ? ", nwii::runtime::kDispatchHle, " : ", 0, ")
+          << e.first << "},\n";
+    out << "};\n\n";
+
+    out << "static const bool g_dispatch_registered =\n"
+           "    nwii::runtime::register_dispatch_tables({g_dispatch, "
+        << entries.size() << ", g_func_bounds, " << num_bounds
+        << ", g_native_funcs, " << num_natives << ", 0x" << std::hex
+        << std::uppercase << entry_point << std::dec << "});\n\n";
+
+    out << "// --- Entry Point Wrapper ---\n";
+    out << "extern \"C\" void run_game(nwii::runtime::CPUContext& ctx) {\n"
+           "    nwii::runtime::run_dispatcher(ctx);\n"
+           "}\n";
+  };
+
   if (config_.split_output) {
     
     std::string header_path = config_.output_dir + "/functions.h";
     std::ofstream hout(header_path);
     hout << "#pragma once\n";
-    hout << "#include \"runtime/cpu_context.h\"\n\n";
+    hout << "namespace nwii::runtime { struct CPUContext; }\n\n";
     hout << "extern \"C\" {\n";
     hout << "void OSReport(nwii::runtime::CPUContext& ctx);\n";
     hout << "void IOS_Open(nwii::runtime::CPUContext& ctx);\n";
@@ -198,6 +317,10 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     hout << "void OSFreeToHeap(nwii::runtime::CPUContext& ctx);\n";
     hout << "void OSGetCurrentThread(nwii::runtime::CPUContext& ctx);\n";
     hout << "void OSSleepThread(nwii::runtime::CPUContext& ctx);\n";
+    // [hle_hooks] may name any native handler, not just the ones above;
+    // declare them all (a repeated identical declaration is harmless).
+    for (const auto &[addr, name] : config_.hle_hooks)
+      hout << "void " << name << "(nwii::runtime::CPUContext& ctx);\n";
     hout << "}\n";
 
     std::set<std::string> emitted_names;
@@ -255,9 +378,9 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
 
       std::string func_name = all_func_names[func_idx];
       const std::string &base_name = all_base_names[func_idx++];
-      if (!func.hle_hook_name.empty() || is_hle_function(base_name)) {
+      if (sig_hooked(func) || is_hle_function(base_name)) {
         std::string target =
-            !func.hle_hook_name.empty() ? func.hle_hook_name : base_name;
+            sig_hooked(func) ? func.hle_hook_name : base_name;
         if (target != func_name) {
           out << "void " << func_name << "(nwii::runtime::CPUContext& ctx) {\n";
           out << "    " << target << "(ctx);\n";
@@ -265,6 +388,7 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
           out << "}\n\n";
         }
       } else {
+        cur_entry_ = start_addr;
         emit_function(out, func, func_name);
       }
 
@@ -281,191 +405,11 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     std::string main_name = "main_output.cpp";
     generated_files.push_back(main_name);
     out.open(config_.output_dir + "/" + main_name);
-    emit_headers(out);
-    out << "#if defined(__GNUC__) || defined(__clang__)\n";
-    out << "#pragma GCC optimize (\"O0\")\n";
-    out << "#endif\n";
-    out << "#if defined(__clang__)\n";
-    out << "#pragma clang optimize off\n";
-    out << "#endif\n\n";
+    // Data only: needs the table types and the function declarations, not
+    // the runtime headers (so runtime header edits don't rebuild it).
+    out << "#include \"runtime/dispatch.h\"\n";
     out << "#include \"functions.h\"\n\n";
-
-    std::string entry_func;
-    if (symbols_ && symbols_->has_symbol(entry_point)) {
-      entry_func = symbols_->get_symbol(entry_point);
-    } else {
-      std::stringstream ss;
-      ss << "func_" << std::hex << std::uppercase << std::setfill('0')
-         << std::setw(8) << entry_point;
-      entry_func = ss.str();
-    }
-
-    out << "// --- Function Bounds Table ---\n";
-    out << "struct FuncBound { uint32_t start; uint32_t end; "
-           "void(*func)(CPUContext&); };\n";
-    out << "static const FuncBound g_func_bounds[] = {\n";
-
-    func_idx = 0;
-    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx];
-      bool is_hle = !func.hle_hook_name.empty() ||
-                    is_hle_function(all_base_names[func_idx]);
-      ++func_idx;
-      if (!is_hle) {
-        out << "    {0x" << std::hex << std::uppercase << start_addr << ", 0x"
-            << func.end_address << ", " << func_name << "},\n";
-      }
-    }
-    out << "    {0, 0, nullptr}\n";
-    out << "};\n\n";
-
-    out << "// --- Entry Point Wrapper ---\n";
-    out << "extern \"C\" void run_game(nwii::runtime::CPUContext& ctx) {\n";
-    out << "    static uint32_t pc_history[10] = {0};\n";
-    out << "    static int pc_history_idx = 0;\n";
-    out << "    if (ctx.pc == 0) ctx.pc = 0x" << std::hex << std::uppercase
-        << entry_point << std::dec << ";\n";
-    out << "    while (ctx.is_running) {\n"
-           "      pc_history[pc_history_idx] = ctx.pc;\n"
-           "      pc_history_idx = (pc_history_idx + 1) % 10;\n"
-           "      if (ctx.pc == 0) {\n"
-           "          static bool warned_zero = false;\n"
-           "          if (!warned_zero) {\n"
-           "              warned_zero = true;\n"
-           "              std::cout << \"[run_game] PC=0 (branch to NULL), last PCs:\";\n"
-           "              for (int i = 0; i < 10; ++i)\n"
-           "                  std::cout << \" 0x\" << std::hex << pc_history[(pc_history_idx + 9 - i) % 10];\n"
-           "              std::cout << \" lr=0x\" << ctx.lr << std::dec << std::endl;\n"
-           "          }\n"
-           "          if ((ctx.msr & 0x8000) == 0) ctx.msr |= 0x8000; // Force "
-           "EE=1 in idle\n"
-           "          process_pending_callbacks(ctx);\n"
-           "          if (ctx.pc == 0) {\n"
-           "              "
-           "std::this_thread::sleep_for(std::chrono::milliseconds(1));\n"
-           "          }\n"
-           "          continue;\n"
-           "      }\n";
-    out << "      if (_setjmp(ctx.exception_jmp_buf) == 0) {\n";
-    out << "        process_pending_callbacks(ctx);\n";
-    out << "        if (ctx.pc == 0xFFFFFFFC) {\n";
-    out << "            if (!ctx.backup_stack.empty()) {\n";
-    out << "                auto& bk = ctx.backup_stack.top();\n";
-    out << "                ctx.gpr = bk.gpr; ctx.fpr = bk.fpr; ctx.ps1 = "
-           "bk.ps1;\n";
-    out << "                ctx.cr = bk.cr; ctx.lr = bk.lr; ctx.ctr = "
-           "bk.ctr;\n";
-    out << "                ctx.xer = bk.xer; ctx.pc = bk.pc;\n"
-           "                ctx.srr0 = bk.srr0; ctx.srr1 = bk.srr1;\n"
-           "                ctx.msr = bk.msr; ctx.fpscr = bk.fpscr;\n"
-           "                ctx.gqr = bk.gqr; ctx.sprg = bk.sprg;\n";
-    out << "                ctx.backup_stack.pop();\n";
-    out << "            }\n";
-    out << "            ctx.callback_depth--;\n";
-    out << "            if (ctx.callback_depth <= 0) {\n";
-    out << "                ctx.in_callback = false;\n";
-    out << "                ctx.callback_depth = 0;\n";
-    out << "            }\n";
-    out << "            continue;\n";
-    out << "        }\n";
-    out << "        if ((ctx.pc & 0xF0000000) == 0xC0000000) ctx.pc = (ctx.pc "
-           "& 0x0FFFFFFF) | 0x80000000;\n";
-    out << "        else if ((ctx.pc & 0xF0000000) == 0xD0000000) ctx.pc = "
-           "(ctx.pc & 0x0FFFFFFF) | 0x90000000;\n";
-    out << "        else if (ctx.pc < 0x80000000) ctx.pc |= 0x80000000;\n";
-    out << "        uint32_t target = ctx.pc;\n        if ((++ctx.inst_count % "
-           "100000) == 0) std::cout << \"Dispatcher PC: 0x\" << std::hex << "
-           "target << std::endl;\n";
-    out << "        switch (target) {\n";
-
-    std::set<uint32_t> emitted_cases;
-
-    func_idx = 0;
-    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx];
-      bool is_hle = !func.hle_hook_name.empty() ||
-                    is_hle_function(all_base_names[func_idx]);
-      ++func_idx;
-
-      if (emitted_cases.insert(start_addr).second) {
-        if (is_hle) {
-          std::string hle_target =
-              !func.hle_hook_name.empty() ? func.hle_hook_name : func_name;
-          out << "            case 0x" << std::hex << std::uppercase
-              << start_addr << std::dec << ": " << hle_target
-              << "(ctx); ctx.pc = ctx.lr; break;\n";
-        } else {
-          out << "            case 0x" << std::hex << std::uppercase
-              << start_addr << std::dec << ": " << func_name
-              << "(ctx); break;\n";
-        }
-      }
-
-      if (!is_hle) {
-        for (const auto &inst : func.instructions) {
-          ppc::Instruction ppc_inst(inst.opcode);
-          if (ppc_inst.is_branch_link() || ppc_inst.opcode() == 17) {
-            uint32_t ret_addr = inst.address + 4;
-            if (emitted_cases.insert(ret_addr).second) {
-              out << "            case 0x" << std::hex << std::uppercase
-                  << ret_addr << std::dec << ": " << func_name
-                  << "(ctx); break;\n";
-            }
-          }
-          if (ppc_inst.opcode() == 16 || ppc_inst.opcode() == 18) {
-            uint32_t target = ppc_inst.branch_target(inst.address);
-            bool is_local =
-                std::find_if(func.instructions.begin(), func.instructions.end(),
-                             [target](const auto &i) {
-                               return i.address == target;
-                             }) != func.instructions.end();
-            if (target <= inst.address && is_local) {
-              if (emitted_cases.insert(inst.address).second) {
-                out << "            case 0x" << std::hex << std::uppercase
-                    << inst.address << std::dec << ": " << func_name
-                    << "(ctx); break;\n";
-              }
-            }
-          }
-        }
-        for (uint32_t jump_target : func.jump_table_targets) {
-          if (emitted_cases.insert(jump_target).second) {
-            out << "            case 0x" << std::hex << std::uppercase
-                << jump_target << std::dec << ": " << func_name
-                << "(ctx); break;\n";
-          }
-        }
-      }
-    }
-    out << "            default: {\n";
-    out << "                bool found = false;\n";
-    out << "                for (const auto& fb : g_func_bounds) {\n";
-    out << "                    if (fb.start == 0) break;\n";
-    out << "                    if (target >= fb.start && target < fb.end) {\n";
-    out << "                        ctx.pc = target;\n";
-    out << "                        fb.func(ctx);\n";
-    out << "                        found = true;\n";
-    out << "                        break;\n";
-    out << "                    }\n";
-    out << "                }\n";
-    out << "                if (!found) {\n";
-    out << "                    // Not in any recompiled function: this is\n";
-    out << "                    // runtime-generated code (copied to low mem,\n";
-    out << "                    // trampolines). Interpret it from memory.\n";
-    out << "                    nwii::runtime::interpret_step(ctx);\n";
-    out << "                }\n";
-    out << "            }\n";
-    out << "        }\n";
-    out << "      } else {\n";
-    out << "          continue;\n";
-    out << "      }\n";
-    out << "    }\n";
-    out << "    std::cout << \"[DEBUG] PC History before 0x0:\\n\";\n";
-    out << "    for (int i=0; i<10; ++i) {\n";
-    out << "        std::cout << \"  0x\" << std::hex << "
-           "pc_history[(pc_history_idx + i) % 10] << \"\\n\";\n";
-    out << "    }\n";
-    out << "}\n";
+    emit_dispatch(out, all_func_names, all_base_names);
     out.close();
     std::cout << "[Recompiler] Generated " << main_name << "\n";
   } else {
@@ -594,185 +538,16 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     for (const auto &[start_addr, func] : analyzer_.get_functions()) {
       std::string func_name = all_func_names[func_idx];
       const std::string &base_name = all_base_names[func_idx++];
-      if (!func.hle_hook_name.empty() || is_hle_function(base_name)) {
+      if (sig_hooked(func) || is_hle_function(base_name)) {
         out << "// [HLE Hook] Skipping generation for " << func_name << "\n\n";
       } else {
+        cur_entry_ = start_addr;
         emit_function(out, func, func_name);
       }
     }
 
-    std::string entry_func;
-    if (symbols_ && symbols_->has_symbol(entry_point)) {
-      entry_func = symbols_->get_symbol(entry_point);
-    } else {
-      std::stringstream ss;
-      ss << "func_" << std::hex << std::uppercase << std::setfill('0')
-         << std::setw(8) << entry_point;
-      entry_func = ss.str();
-    }
-
-    out << "\n// --- Function Bounds Table ---\n";
-    out << "struct FuncBound { uint32_t start; uint32_t end; "
-           "void(*func)(CPUContext&); };\n";
-    out << "static const FuncBound g_func_bounds[] = {\n";
-
-    func_idx = 0;
-    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx];
-      bool is_hle = !func.hle_hook_name.empty() ||
-                    is_hle_function(all_base_names[func_idx]);
-      ++func_idx;
-      if (!is_hle) {
-        out << "    {0x" << std::hex << std::uppercase << start_addr << ", 0x"
-            << func.end_address << ", " << func_name << "},\n";
-      }
-    }
-    out << "    {0, 0, nullptr}\n";
-    out << "};\n\n";
-
-    out << "// --- Entry Point Wrapper ---\n";
-    out << "extern \"C\" void run_game(nwii::runtime::CPUContext& ctx) {\n";
-    out << "    static uint32_t pc_history[10] = {0};\n";
-    out << "    static int pc_history_idx = 0;\n";
-    out << "    if (ctx.pc == 0) ctx.pc = 0x" << std::hex << std::uppercase
-        << entry_point << std::dec << ";\n";
-    out << "    while (ctx.is_running) {\n"
-           "      pc_history[pc_history_idx] = ctx.pc;\n"
-           "      pc_history_idx = (pc_history_idx + 1) % 10;\n"
-           "      if (ctx.pc == 0) {\n"
-           "          static bool warned_zero = false;\n"
-           "          if (!warned_zero) {\n"
-           "              warned_zero = true;\n"
-           "              std::cout << \"[run_game] PC=0 (branch to NULL), last PCs:\";\n"
-           "              for (int i = 0; i < 10; ++i)\n"
-           "                  std::cout << \" 0x\" << std::hex << pc_history[(pc_history_idx + 9 - i) % 10];\n"
-           "              std::cout << \" lr=0x\" << ctx.lr << std::dec << std::endl;\n"
-           "          }\n"
-           "          if ((ctx.msr & 0x8000) == 0) ctx.msr |= 0x8000; // Force "
-           "EE=1 in idle\n"
-           "          process_pending_callbacks(ctx);\n"
-           "          if (ctx.pc == 0) {\n"
-           "              "
-           "std::this_thread::sleep_for(std::chrono::milliseconds(1));\n"
-           "          }\n"
-           "          continue;\n"
-           "      }\n";
-    out << "      try {\n";
-    out << "        process_pending_callbacks(ctx);\n";
-    out << "        if (ctx.pc == 0xFFFFFFFC) {\n";
-    out << "            if (!ctx.backup_stack.empty()) {\n";
-    out << "                auto& bk = ctx.backup_stack.top();\n";
-    out << "                ctx.gpr = bk.gpr; ctx.fpr = bk.fpr; ctx.ps1 = "
-           "bk.ps1;\n";
-    out << "                ctx.cr = bk.cr; ctx.lr = bk.lr; ctx.ctr = "
-           "bk.ctr;\n";
-    out << "                ctx.xer = bk.xer; ctx.pc = bk.pc;\n"
-           "                ctx.srr0 = bk.srr0; ctx.srr1 = bk.srr1;\n"
-           "                ctx.msr = bk.msr; ctx.fpscr = bk.fpscr;\n"
-           "                ctx.gqr = bk.gqr; ctx.sprg = bk.sprg;\n";
-    out << "                ctx.backup_stack.pop();\n";
-    out << "            }\n";
-    out << "            ctx.callback_depth--;\n";
-    out << "            if (ctx.callback_depth <= 0) {\n";
-    out << "                ctx.in_callback = false;\n";
-    out << "                ctx.callback_depth = 0;\n";
-    out << "            }\n";
-    out << "            continue;\n";
-    out << "        }\n";
-    out << "        if ((ctx.pc & 0xF0000000) == 0xC0000000) ctx.pc = (ctx.pc "
-           "& 0x0FFFFFFF) | 0x80000000;\n";
-    out << "        else if ((ctx.pc & 0xF0000000) == 0xD0000000) ctx.pc = "
-           "(ctx.pc & 0x0FFFFFFF) | 0x90000000;\n";
-    out << "        else if (ctx.pc < 0x80000000) ctx.pc |= 0x80000000;\n";
-    out << "        uint32_t target = ctx.pc;\n        if ((++ctx.inst_count % "
-           "100000) == 0) std::cout << \"Dispatcher PC: 0x\" << std::hex << "
-           "target << std::endl;\n";
-    out << "        switch (target) {\n";
-
-    std::set<uint32_t> emitted_cases;
-
-    func_idx = 0;
-    for (const auto &[start_addr, func] : analyzer_.get_functions()) {
-      std::string func_name = all_func_names[func_idx];
-      bool is_hle = !func.hle_hook_name.empty() ||
-                    is_hle_function(all_base_names[func_idx]);
-      ++func_idx;
-
-      if (emitted_cases.insert(start_addr).second) {
-        if (is_hle) {
-          std::string hle_target =
-              !func.hle_hook_name.empty() ? func.hle_hook_name : func_name;
-          out << "            case 0x" << std::hex << std::uppercase
-              << start_addr << std::dec << ": " << hle_target
-              << "(ctx); ctx.pc = ctx.lr; break;\n";
-        } else {
-          out << "            case 0x" << std::hex << std::uppercase
-              << start_addr << std::dec << ": " << func_name
-              << "(ctx); break;\n";
-        }
-      }
-
-      if (!is_hle) {
-        for (const auto &inst : func.instructions) {
-          ppc::Instruction ppc_inst(inst.opcode);
-          if (ppc_inst.is_branch_link() || ppc_inst.opcode() == 17) {
-            uint32_t ret_addr = inst.address + 4;
-            if (emitted_cases.insert(ret_addr).second) {
-              out << "            case 0x" << std::hex << std::uppercase
-                  << ret_addr << std::dec << ": " << func_name
-                  << "(ctx); break;\n";
-            }
-          }
-          if (ppc_inst.opcode() == 16 || ppc_inst.opcode() == 18) {
-            uint32_t target = ppc_inst.branch_target(inst.address);
-            bool is_local =
-                std::find_if(func.instructions.begin(), func.instructions.end(),
-                             [target](const auto &i) {
-                               return i.address == target;
-                             }) != func.instructions.end();
-            if (target <= inst.address && is_local) {
-              if (emitted_cases.insert(inst.address).second) {
-                out << "            case 0x" << std::hex << std::uppercase
-                    << inst.address << std::dec << ": " << func_name
-                    << "(ctx); break;\n";
-              }
-            }
-          }
-        }
-        for (uint32_t jump_target : func.jump_table_targets) {
-          if (emitted_cases.insert(jump_target).second) {
-            out << "            case 0x" << std::hex << std::uppercase
-                << jump_target << std::dec << ": " << func_name
-                << "(ctx); break;\n";
-          }
-        }
-      }
-    }
-    out << "            default: {\n";
-    out << "                std::cerr << \"UNKNOWN DISPATCH TO 0x\" << "
-           "std::hex << target << \"\\n\";\n";
-    out << "                bool found = false;\n";
-    out << "                for (const auto& fb : g_func_bounds) {\n";
-    out << "                    if (fb.start == 0) break;\n";
-    out << "                    if (target >= fb.start && target < fb.end) {\n";
-    out << "                        std::cerr << \"  -> Fallback dispatch to "
-           "function 0x\" << std::hex << fb.start << \"\\n\";\n";
-    out << "                        ctx.pc = target;\n";
-    out << "                        fb.func(ctx);\n";
-    out << "                        found = true;\n";
-    out << "                        break;\n";
-    out << "                    }\n";
-    out << "                }\n";
-    out << "                if (!found) std::exit(1);\n";
-    out << "            }\n";
-    out << "        }\n";
-    out << "    }\n";
-    out << "    std::cout << \"[DEBUG] PC History before 0x0:\\n\";\n";
-    out << "    for (int i=0; i<10; ++i) {\n";
-    out << "        std::cout << \"  0x\" << std::hex << "
-           "pc_history[(pc_history_idx + i) % 10] << \"\\n\";\n";
-    out << "    }\n";
-    out << "}\n";
+    out << "\n#include \"runtime/dispatch.h\"\n\n";
+    emit_dispatch(out, all_func_names, all_base_names);
   }
 
   return generated_files;
@@ -897,6 +672,21 @@ bool Recompiler::generate_cmake_project(uint32_t entry_point) {
   
   out << "target_link_libraries(" << config_.project_name
       << " PRIVATE nwiiruntime)\n";
+  // A linker map names runtime code in NWII_NPROF profiles.
+  // /GS-: generated functions keep guest state in ctx, not in stack buffers,
+  // so the security cookie checks were pure overhead (~2% of the CPU thread).
+  out << "if(MSVC)\n    target_link_options(" << config_.project_name
+      << " PRIVATE /MAP)\n    target_compile_options(" << config_.project_name
+      << " PRIVATE /GS-)\nendif()\n";
+
+  // Optional differential test (recompiled instruction bodies vs the
+  // interpreter), generated into ../difftest; never built by default.
+  out << "\nif(EXISTS \"${CMAKE_SOURCE_DIR}/../difftest/gen/table.cpp\")\n"
+         "    file(GLOB NWII_DIFFTEST_SRC \"${CMAKE_SOURCE_DIR}/../difftest/gen/*.cpp\")\n"
+         "    add_executable(nwii_difftest EXCLUDE_FROM_ALL ../difftest/main.cpp ${NWII_DIFFTEST_SRC})\n"
+         "    target_include_directories(nwii_difftest PRIVATE nWiiRuntime/src nWiiRuntime/include ../difftest)\n"
+         "    target_link_libraries(nwii_difftest PRIVATE nwiiruntime)\n"
+         "endif()\n";
 
   return true;
 }
@@ -921,14 +711,23 @@ std::string Recompiler::generate_function_cpp(const analyzer::Function &func) {
 void Recompiler::emit_function(std::ostream &out,
                                const analyzer::Function &func,
                                const std::string &func_name) {
-  out << "void " << func_name << "(CPUContext& ctx) {\n";
+  // NWII_RESTRICT (__restrict where supported): guest RAM stores go through
+  // byte pointers, so without it the compiler reloads guest registers from
+  // ctx after every store. Calls that receive ctx still reload as usual.
+  out << "void " << func_name << "(CPUContext& NWII_RESTRICT ctx) {\n";
 
-  
-  
+
+
   auto hook = config_.hle_hooks.find(func.start_address);
   if (hook != config_.hle_hooks.end()) {
     out << "    " << hook->second << "(ctx);\n";
     out << "    ctx.pc = ctx.lr; return;\n";
+    // The replaced instructions, as comments only, in the usual format: tools
+    // can derive a native for the hook from them (game code is never stored
+    // with a project; it is regenerated from the user's disc).
+    for (const auto &inst : func.instructions)
+      out << "    // 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8)
+          << inst.address << ": " << std::setw(8) << inst.opcode << std::dec << "\n";
     out << "}\n\n";
     return;
   }
@@ -956,17 +755,80 @@ void Recompiler::emit_function(std::ostream &out,
       << std::uppercase << func.start_address << std::dec
       << ") nwii::runtime::trace_call(0x" << std::hex << std::uppercase
       << func.start_address << std::dec << ", ctx);\n";
+  out << "    if (nwii::runtime::g_interp_mode && 0x" << std::hex << std::uppercase
+      << func.start_address << std::dec
+      << "u < nwii::runtime::g_interp_limit) { nwii::runtime::interp_run(ctx); return; }\n";
 
   std::set<uint32_t> valid_addrs;
   for (const auto &inst : func.instructions) {
     valid_addrs.insert(inst.address);
   }
 
+  // The body is generated first: with lean_entry_switch the entry switch
+  // depends on which addresses the body stores into ctx.pc.
+  std::ostringstream body;
+  if (!config_.count_instructions)
+    body << "    ++ctx.inst_count; // once per call (count_instructions = false)\n";
+  for (const auto &inst : func.instructions) {
+    if (config_.count_instructions)
+      body << "    ++ctx.inst_count;\n";
+    emit_instruction(body, inst, func);
+  }
+  const std::string body_text = body.str();
+
+  std::set<uint32_t> entry_addrs;
+  if (config_.lean_entry_switch) {
+    if (!extern_targets_ready_) {
+      extern_targets_ready_ = true;
+      for (const auto &[start, f] : analyzer_.get_functions()) {
+        std::set<uint32_t> own;
+        for (const auto &in : f.instructions) own.insert(in.address);
+        for (const auto &in : f.instructions) {
+          ppc::Instruction pi(in.opcode);
+          if (pi.opcode() == 18 || pi.opcode() == 16) {
+            const uint32_t t = pi.branch_target(in.address);
+            if (!own.count(t)) extern_targets_.insert(t);
+          }
+        }
+      }
+    }
+    auto add = [&](uint32_t a) {
+      if (valid_addrs.count(a)) entry_addrs.insert(a);
+    };
+    for (const auto &inst : func.instructions) {
+      ppc::Instruction pi(inst.opcode);
+      if (pi.is_branch_link() || pi.opcode() == 17) add(inst.address + 4); // return addresses
+      if (pi.opcode() == 16 || pi.opcode() == 18) {
+        const uint32_t t = pi.branch_target(inst.address);
+        if (t <= inst.address && valid_addrs.count(t)) add(inst.address); // back-edge poll
+      }
+      if (extern_targets_.count(inst.address)) add(inst.address);
+      // Addresses that are join points anyway cost nothing extra as entries,
+      // and they cover jump tables the analyzer missed (switch cases are
+      // reached via bctr): local branch targets, and addresses right after
+      // an unconditional transfer (reachable only by a jump).
+      if (pi.opcode() == 16 || pi.opcode() == 18) add(pi.branch_target(inst.address));
+      const bool uncond_branch = pi.opcode() == 18 && !pi.lk();
+      const bool uncond_indirect = pi.is_unconditional_indirect_branch() && !pi.lk();
+      if (uncond_branch || uncond_indirect) add(inst.address + 4);
+    }
+    for (uint32_t t : func.jump_table_targets) add(t);
+    add(cur_entry_); // the dispatcher routes the function's key here
+    // Every constant the body stores into ctx.pc (poll/mtmsr/call resume).
+    static const std::string kPc = "ctx.pc = 0x";
+    for (size_t p = body_text.find(kPc); p != std::string::npos;
+         p = body_text.find(kPc, p + kPc.size())) {
+      add((uint32_t)std::strtoul(body_text.c_str() + p + kPc.size(), nullptr, 16));
+    }
+  } else {
+    entry_addrs = valid_addrs;
+  }
+
   if (valid_addrs.size() > 1) {
     out << "    if (ctx.pc != 0x" << std::hex << std::uppercase
         << func.start_address << std::dec << ") {\n";
     out << "        switch (ctx.pc) {\n";
-    for (uint32_t addr : valid_addrs) {
+    for (uint32_t addr : entry_addrs) {
       if (addr != func.start_address) {
         out << "            case 0x" << std::hex << std::uppercase << addr
             << std::dec << ": goto loc_" << std::hex << std::uppercase << addr
@@ -982,14 +844,7 @@ void Recompiler::emit_function(std::ostream &out,
     out << "    }\n";
 
   }
-  for (const auto &inst : func.instructions) {
-
-    
-
-    
-    out << "    ++ctx.inst_count;\n";
-    emit_instruction(out, inst, func);
-  }
+  out << body_text;
 
   out << "}\n\n";
 }
@@ -1242,8 +1097,8 @@ void Recompiler::emit_instruction(std::ostream &out,
 
       out << "    ctx.pc = 0x" << std::hex << std::uppercase << inst.address
           << std::dec << ";\n";
-      out << "    if (process_pending_callbacks(ctx)) return;\n";
-      out << "    if ((ctx.inst_count % 10000000) == 0) { std::cout << "
+      out << "    if (nwii::runtime::poll_callbacks(ctx)) return;\n";
+      out << "    if (nwii::runtime::g_verbose && (ctx.inst_count % 10000000) == 0) { std::cout << "
              "\"Spinning at PC: 0x\" << std::hex << 0x"
           << std::uppercase << std::hex << inst.address << std::dec
           << " << \" LR: 0x\" << std::hex << ctx.lr << std::dec << std::endl; "
@@ -1351,8 +1206,8 @@ void Recompiler::emit_instruction(std::ostream &out,
 
       out << "    ctx.pc = 0x" << std::hex << std::uppercase << inst.address
           << std::dec << ";\n";
-      out << "    if (process_pending_callbacks(ctx)) return;\n";
-      out << "    if ((ctx.inst_count % 10000000) == 0) { std::cout << "
+      out << "    if (nwii::runtime::poll_callbacks(ctx)) return;\n";
+      out << "    if (nwii::runtime::g_verbose && (ctx.inst_count % 10000000) == 0) { std::cout << "
              "\"Spinning at PC: 0x\" << std::hex << 0x"
           << std::uppercase << std::hex << inst.address << std::dec
           << " << \" LR: 0x\" << std::hex << ctx.lr << std::dec << std::endl; "
@@ -1508,9 +1363,14 @@ void Recompiler::emit_instruction(std::ostream &out,
         
         bool null_guard = ppc_inst.lk() && target_reg == "ctx.ctr";
         if (cond_expr == "true") {
+          // bctrl: call the target in place like a direct bl (no unwind to
+          // the dispatcher and back through its resume switch); unknown
+          // targets still take the dispatcher route.
           if (null_guard)
             out << "    if (" << target_reg << ") { ctx.pc = " << target_reg
-                << "; return; } else nwii::runtime::note_null_call(0x"
+                << "; if (!nwii::runtime::call_indirect(ctx) || ctx.pc != 0x"
+                << std::hex << std::uppercase << (inst.address + 4) << std::dec
+                << ") return; } else nwii::runtime::note_null_call(0x"
                 << std::hex << std::uppercase << inst.address << std::dec
                 << ", ctx.lr);\n";
           else
@@ -1644,6 +1504,9 @@ void Recompiler::emit_instruction(std::ostream &out,
           << " << \" at 0x\" << std::hex << ctx.pc << std::dec << \"\\n\"; "
              "std::exit(1);\n";
     }
+    // Gekko writes a single-precision result to both paired-single slots;
+    // compiled code later reads ps1 (ps_merge*, psq_st with W=0).
+    out << "    ctx.ps1[" << fD << "] = ctx.fpr[" << fD << "];\n";
   } else if (ppc_inst.opcode() == 63) {
     uint32_t xo = (ppc_inst.value() >> 1) & 0x3FF;
     uint32_t fD = ppc_inst.rd();
@@ -1660,20 +1523,20 @@ void Recompiler::emit_instruction(std::ostream &out,
       out << "    ctx.fpr[" << fD << "] = -std::fabs(ctx.fpr[" << fB
           << "]); // fnabs\n";
     } else if (xo == 12) { 
-      out << "    ctx.fpr[" << fD << "] = (double)(float)ctx.fpr[" << fB
-          << "]; // frsp\n";
+      out << "    ctx.fpr[" << fD << "] = ctx.ps1[" << fD
+          << "] = (double)(float)ctx.fpr[" << fB << "]; // frsp\n";
     } else if (xo == 15) { 
       out << "    {\n";
-      out << "        uint32_t i_val = (uint32_t)(int32_t)ctx.fpr[" << fB
-          << "];\n";
+      out << "        uint32_t i_val = nwii::runtime::ppc_cvt_s32(std::trunc(ctx.fpr["
+          << fB << "]));\n";
       out << "        uint64_t val = i_val;\n";
       out << "        std::memcpy(&ctx.fpr[" << fD << "], &val, 8);\n";
       out << "    } // fctiwz\n";
     } else if (xo == 14) { 
       out << "    {\n";
       out << "        uint32_t i_val = "
-             "(uint32_t)(int32_t)std::nearbyint(ctx.fpr["
-          << fB << "]);\n";
+             "nwii::runtime::ppc_cvt_s32(std::nearbyint(ctx.fpr["
+          << fB << "]));\n";
       out << "        uint64_t val = i_val;\n";
       out << "        std::memcpy(&ctx.fpr[" << fD << "], &val, 8);\n";
       out << "    } // fctiw\n";
@@ -1699,21 +1562,21 @@ void Recompiler::emit_instruction(std::ostream &out,
     } else if ((xo & 0x1F) == 25) { 
       out << "    ctx.fpr[" << fD << "] = ctx.fpr[" << fA << "] * ctx.fpr["
           << ((ppc_inst.value() >> 6) & 0x1F) << "]; // fmul\n";
-    } else if ((xo & 0x1F) == 29) { 
-      out << "    ctx.fpr[" << fD << "] = ctx.fpr[" << fA << "] * ctx.fpr["
-          << ((ppc_inst.value() >> 6) & 0x1F) << "] + ctx.fpr[" << fB
-          << "]; // fmadd\n";
-    } else if ((xo & 0x1F) == 28) { 
-      out << "    ctx.fpr[" << fD << "] = ctx.fpr[" << fA << "] * ctx.fpr["
-          << ((ppc_inst.value() >> 6) & 0x1F) << "] - ctx.fpr[" << fB
-          << "]; // fmsub\n";
-    } else if ((xo & 0x1F) == 31) { 
-      out << "    ctx.fpr[" << fD << "] = -(ctx.fpr[" << fA << "] * ctx.fpr["
-          << ((ppc_inst.value() >> 6) & 0x1F) << "] + ctx.fpr[" << fB
+    } else if ((xo & 0x1F) == 29) { // fused, one rounding, like Gekko
+      out << "    ctx.fpr[" << fD << "] = std::fma(ctx.fpr[" << fA << "], ctx.fpr["
+          << ((ppc_inst.value() >> 6) & 0x1F) << "], ctx.fpr[" << fB
+          << "]); // fmadd\n";
+    } else if ((xo & 0x1F) == 28) {
+      out << "    ctx.fpr[" << fD << "] = std::fma(ctx.fpr[" << fA << "], ctx.fpr["
+          << ((ppc_inst.value() >> 6) & 0x1F) << "], -ctx.fpr[" << fB
+          << "]); // fmsub\n";
+    } else if ((xo & 0x1F) == 31) {
+      out << "    ctx.fpr[" << fD << "] = -std::fma(ctx.fpr[" << fA << "], ctx.fpr["
+          << ((ppc_inst.value() >> 6) & 0x1F) << "], ctx.fpr[" << fB
           << "]); // fnmadd\n";
-    } else if ((xo & 0x1F) == 30) { 
-      out << "    ctx.fpr[" << fD << "] = -(ctx.fpr[" << fA << "] * ctx.fpr["
-          << ((ppc_inst.value() >> 6) & 0x1F) << "] - ctx.fpr[" << fB
+    } else if ((xo & 0x1F) == 30) {
+      out << "    ctx.fpr[" << fD << "] = -std::fma(ctx.fpr[" << fA << "], ctx.fpr["
+          << ((ppc_inst.value() >> 6) & 0x1F) << "], -ctx.fpr[" << fB
           << "]); // fnmsub\n";
     } else if ((xo & 0x1F) == 23) { 
       out << "    ctx.fpr[" << fD << "] = (ctx.fpr[" << fA
@@ -1916,17 +1779,21 @@ void Recompiler::emit_instruction(std::ostream &out,
             << "] > 0); ctx.cr[0].eq = (ctx.gpr[" << rD << "] == 0);\n";
       }
     } else if (xo == 491) {
-      out << "    if (ctx.gpr[" << rB << "] != 0) ctx.gpr[" << rD
-          << "] = (uint32_t)((int32_t)ctx.gpr[" << rA << "] / (int32_t)ctx.gpr["
-          << rB << "]); // divw\n";
+      // /0 and INT_MIN/-1 (the latter traps on x86): Gekko gives the
+      // dividend's sign, 0 or -1 (as Dolphin does).
+      out << "    if (ctx.gpr[" << rB << "] != 0 && !(ctx.gpr[" << rA
+          << "] == 0x80000000u && ctx.gpr[" << rB << "] == 0xFFFFFFFFu)) ctx.gpr["
+          << rD << "] = (uint32_t)((int32_t)ctx.gpr[" << rA << "] / (int32_t)ctx.gpr["
+          << rB << "]); else ctx.gpr[" << rD << "] = ((int32_t)ctx.gpr[" << rA
+          << "] < 0) ? 0xFFFFFFFFu : 0u; // divw\n";
       if (ppc_inst.value() & 1) {
         out << "    ctx.cr[0].lt = ((int32_t)ctx.gpr[" << rD
             << "] < 0); ctx.cr[0].gt = ((int32_t)ctx.gpr[" << rD
             << "] > 0); ctx.cr[0].eq = (ctx.gpr[" << rD << "] == 0);\n";
       }
     } else if (xo == 459) {
-      out << "    if (ctx.gpr[" << rB << "] != 0) ctx.gpr[" << rD
-          << "] = ctx.gpr[" << rA << "] / ctx.gpr[" << rB << "]; // divwu\n";
+      out << "    ctx.gpr[" << rD << "] = ctx.gpr[" << rB << "] ? ctx.gpr[" << rA
+          << "] / ctx.gpr[" << rB << "] : 0u; // divwu (0 on /0, like Gekko)\n";
       if (ppc_inst.value() & 1) {
         out << "    ctx.cr[0].lt = ((int32_t)ctx.gpr[" << rD
             << "] < 0); ctx.cr[0].gt = ((int32_t)ctx.gpr[" << rD
@@ -1991,10 +1858,17 @@ void Recompiler::emit_instruction(std::ostream &out,
             << "] > 0); ctx.cr[0].eq = (ctx.gpr[" << rA << "] == 0);\n";
       }
     } else if (xo == 792) {
-      out << "    ctx.gpr[" << rA << "] = (uint32_t)((ctx.gpr[" << rB
-          << "] & 0x20) ? ((int32_t)ctx.gpr[" << rS
-          << "] >> 31) : ((int32_t)ctx.gpr[" << rS << "] >> (ctx.gpr[" << rB
-          << "] & 0x1F))); // sraw\n";
+      // CA = negative source with 1-bits shifted out (srawi below likewise).
+      out << "    {\n";
+      out << "        int32_t sv = (int32_t)ctx.gpr[" << rS << "];\n";
+      out << "        uint32_t sh = ctx.gpr[" << rB << "] & 0x3F;\n";
+      out << "        uint32_t ca;\n";
+      out << "        if (sh >= 32) { ctx.gpr[" << rA
+          << "] = (uint32_t)(sv >> 31); ca = sv < 0; }\n";
+      out << "        else { ctx.gpr[" << rA << "] = (uint32_t)(sv >> sh); "
+             "ca = sv < 0 && sh && ((uint32_t)sv & ((1u << sh) - 1)); }\n";
+      out << "        ctx.xer = (ctx.xer & ~(1u << 29)) | (ca << 29);\n";
+      out << "    } // sraw\n";
       if (ppc_inst.value() & 1) {
         out << "    ctx.cr[0].lt = ((int32_t)ctx.gpr[" << rA
             << "] < 0); ctx.cr[0].gt = ((int32_t)ctx.gpr[" << rA
@@ -2223,22 +2097,6 @@ void Recompiler::emit_instruction(std::ostream &out,
           << "]);\n";
       out << "        ctx.gpr[" << rA << "] = ea;\n";
       out << "    } // sthux\n";
-    } else if (xo == 792) { 
-
-      out << "    {\n";
-      out << "        int32_t sv = (int32_t)ctx.gpr[" << rA << "];\n";
-      out << "        uint32_t sh = ctx.gpr[" << rB << "] & 0x3F;\n";
-      out << "        uint32_t ca;\n";
-      out << "        if (sh >= 32) { ctx.gpr[" << rD
-          << "] = (sv < 0) ? 0xFFFFFFFF : 0; ca = (sv < 0) ? 1 : 0; }\n";
-      out << "        else { ctx.gpr[" << rD << "] = (uint32_t)(sv >> sh);\n";
-      out << "            ca = (sv < 0 && (uint32_t)(sv & ((sh==0)?0:((1u<<sh)-1))) != 0) ? 1 : 0; }\n";
-      out << "        ctx.xer = (ctx.xer & ~(1u << 29)) | (ca << 29);\n";
-      if (ppc_inst.value() & 1)
-        out << "        ctx.cr[0].lt = ((int32_t)ctx.gpr[" << rD
-            << "] < 0); ctx.cr[0].gt = ((int32_t)ctx.gpr[" << rD
-            << "] > 0); ctx.cr[0].eq = (ctx.gpr[" << rD << "] == 0);\n";
-      out << "    } // sraw\n";
     } else if (xo == 824) { 
 
       
@@ -2327,8 +2185,8 @@ void Recompiler::emit_instruction(std::ostream &out,
       out << "    ctx.gpr[" << rA << "] += ctx.gpr[" << rB << "];\n";
     } else if (xo == 983) { 
       out << "    ctx.mmu.write32(ctx.gpr[" << rA << "] + ctx.gpr[" << rB
-          << "], (uint32_t)(int32_t)ctx.fpr[" << ppc_inst.rs()
-          << "]); // stfiwx\n";
+          << "], nwii::runtime::fpr_low_word(ctx.fpr[" << ppc_inst.rs()
+          << "])); // stfiwx (raw low word, e.g. an fctiwz result)\n";
     } else if (xo == 790) { 
       out << "    { uint16_t v = ctx.mmu.read16(ctx.gpr[" << rA
           << "] + ctx.gpr[" << rB << "]); ctx.gpr[" << rD
@@ -2421,27 +2279,41 @@ void Recompiler::emit_instruction(std::ostream &out,
   } else if (ppc_inst.opcode() == 7) { 
     out << "    ctx.gpr[" << ppc_inst.rd() << "] = (uint32_t)((int32_t)ctx.gpr["
         << ppc_inst.ra() << "] * " << ppc_inst.simm() << "); // mulli\n";
-  } else if (ppc_inst.opcode() == 8) { 
-    out << "    ctx.gpr[" << ppc_inst.rd() << "] = (uint32_t)("
-        << ppc_inst.simm() << " - (int32_t)ctx.gpr[" << ppc_inst.ra()
-        << "]); // subfic\n";
-  } else if (ppc_inst.opcode() == 12) { 
+  } else if (ppc_inst.opcode() == 8) {
+    // subfic: rD = SIMM - rA, CA = carry out of ~rA + SIMM + 1 (32-bit
+    // unsigned). CodeWarrior pairs it with adde/subfe for ==/!= tests, so a
+    // missing CA silently flips those comparisons.
+    char imm[16];
+    std::snprintf(imm, sizeof(imm), "0x%08Xull", (uint32_t)ppc_inst.simm());
+    out << "    {\n";
+    out << "        uint64_t res = (uint64_t)(~ctx.gpr[" << ppc_inst.ra()
+        << "]) + " << imm << " + 1;\n";
+    out << "        ctx.gpr[" << ppc_inst.rd() << "] = (uint32_t)res; // subfic\n";
+    out << "        ctx.xer = (ctx.xer & ~(1 << 29)) | (((res >> 32) & 1) << "
+           "29); // CA\n";
+    out << "    }\n";
+  } else if (ppc_inst.opcode() == 12) {
     uint32_t rD = ppc_inst.rd();
     uint32_t rA = ppc_inst.ra();
-    int32_t simm = ppc_inst.simm();
+    // The immediate is sign-extended to 32 bits and then added as an
+    // unsigned 32-bit value: "+ -1" would widen to 2^64-1 and invert CA
+    // (EXIGetID's `start != now` test failed, so memory cards never probed).
+    char imm[16];
+    std::snprintf(imm, sizeof(imm), "0x%08Xull", (uint32_t)ppc_inst.simm());
     out << "    {\n";
-    out << "        uint64_t res = (uint64_t)ctx.gpr[" << rA << "] + " << simm
+    out << "        uint64_t res = (uint64_t)ctx.gpr[" << rA << "] + " << imm
         << ";\n";
     out << "        ctx.gpr[" << rD << "] = (uint32_t)res;\n";
     out << "        ctx.xer = (ctx.xer & ~(1 << 29)) | (((res >> 32) & 1) << "
            "29); // CA\n";
     out << "    }\n";
-  } else if (ppc_inst.opcode() == 13) { 
+  } else if (ppc_inst.opcode() == 13) {
     uint32_t rD = ppc_inst.rd();
     uint32_t rA = ppc_inst.ra();
-    int32_t simm = ppc_inst.simm();
+    char imm[16];
+    std::snprintf(imm, sizeof(imm), "0x%08Xull", (uint32_t)ppc_inst.simm());
     out << "    {\n";
-    out << "        uint64_t res = (uint64_t)ctx.gpr[" << rA << "] + " << simm
+    out << "        uint64_t res = (uint64_t)ctx.gpr[" << rA << "] + " << imm
         << ";\n";
     out << "        ctx.gpr[" << rD << "] = (uint32_t)res;\n";
     out << "        ctx.xer = (ctx.xer & ~(1 << 29)) | (((res >> 32) & 1) << "
@@ -2544,12 +2416,9 @@ void Recompiler::emit_instruction(std::ostream &out,
     } else if (xo_10 == 1014) {
       out << "    // dcbz_l (no-op)\n";
     } else {
-      out << "    std::cerr << \"UNIMPLEMENTED Opcode 4 (ps_*) XO \" << " << xo
-          << " << \" XO_10 \" << " << xo_10
-          << " << \" at 0x\" << std::hex << ctx.pc << std::dec << \"\\n\"; "
-             "std::exit(1);\n";
-      out << "    ctx.fpr[" << frD << "] = 0.0;\n";
-      out << "    ctx.ps1[" << frD << "] = 0.0;\n";
+      // ps_res, ps_rsqrte, psq_lx/stx/lux/stux: the interpreter has them.
+      out << "    nwii::runtime::micro_interpret(ctx, 0x" << std::hex
+          << inst.opcode << ", 0x" << inst.address << std::dec << ");\n";
     }
   } else if (ppc_inst.opcode() == 10) { 
     uint32_t crD = ppc_inst.rd() >> 2;

@@ -2,6 +2,11 @@
 #include "runtime/cpu_context.h"
 #include <iostream>
 #include <atomic>
+#include <cstdlib>
+
+// Cached: std::getenv takes a lock and scans the environment, and these
+// checks sit on the per-branch interrupt-poll path.
+static const bool s_env_sample = std::getenv("NWII_SAMPLE") != nullptr;
 
 namespace nwii::runtime {
 extern CPUContext *g_ctx_ptr;
@@ -50,7 +55,7 @@ void register_pe(MMIODispatcher &dispatcher) {
         },
         [](uint32_t addr, uint32_t val) {
             if (addr == 0xCC00100A) {
-                if (std::getenv("NWII_SAMPLE")) {
+                if (s_env_sample) {
                     static int n = 0;
                     if (n++ < 12)
                         std::cout << "[PE] ctrl write @" << std::hex << addr

@@ -1,5 +1,6 @@
 #include "mouse_keyboard_source.h"
 #include "runtime/config.h"
+#include "input/key_bindings.h"
 #include <SDL.h>
 
 namespace nwii::runtime::input {
@@ -27,17 +28,33 @@ void MouseKeyboardSource::update(GameCubePadState pads[4], WiimoteState motes[4]
     if (keys[SDL_SCANCODE_LEFT]) motes[0].buttons |= 0x0001; 
     if (keys[SDL_SCANCODE_RIGHT]) motes[0].buttons |= 0x0002; 
 
-    pads[0].err = 0; 
-    if (keys[SDL_SCANCODE_SPACE]) pads[0].buttons |= 0x0100;
-    if (keys[SDL_SCANCODE_RETURN]) pads[0].buttons |= 0x1000;
-    if (keys[SDL_SCANCODE_UP]) pads[0].buttons |= 0x0008;
-    if (keys[SDL_SCANCODE_DOWN]) pads[0].buttons |= 0x0004;
-    if (keys[SDL_SCANCODE_LEFT]) pads[0].buttons |= 0x0001;
-    if (keys[SDL_SCANCODE_RIGHT]) pads[0].buttons |= 0x0002;
-    if (keys[SDL_SCANCODE_W]) pads[0].stick_y = 127;
-    if (keys[SDL_SCANCODE_S]) pads[0].stick_y = -128;
-    if (keys[SDL_SCANCODE_D]) pads[0].stick_x = 127;
-    if (keys[SDL_SCANCODE_A]) pads[0].stick_x = -128;
+    // GameCube pad 0 on the keyboard, through the rebindable table
+    // (input/key_bindings.h; defaults WASD stick, arrows C-stick, Space A...).
+    pads[0].err = 0;
+    auto down = [&](PadControl c) {
+        const int sc = binding(c).scancode;
+        return sc > 0 && sc < SDL_NUM_SCANCODES && keys[sc];
+    };
+    if (down(PadControl::A)) pads[0].buttons |= 0x0100;
+    if (down(PadControl::B)) pads[0].buttons |= 0x0200;
+    if (down(PadControl::X)) pads[0].buttons |= 0x0400;
+    if (down(PadControl::Y)) pads[0].buttons |= 0x0800;
+    if (down(PadControl::Z)) pads[0].buttons |= 0x0010;
+    if (down(PadControl::Start)) pads[0].buttons |= 0x1000;
+    if (down(PadControl::L)) { pads[0].buttons |= 0x0040; pads[0].trigger_l = 255; }
+    if (down(PadControl::R)) { pads[0].buttons |= 0x0020; pads[0].trigger_r = 255; }
+    if (down(PadControl::DUp)) pads[0].buttons |= 0x0008;
+    if (down(PadControl::DDown)) pads[0].buttons |= 0x0004;
+    if (down(PadControl::DLeft)) pads[0].buttons |= 0x0001;
+    if (down(PadControl::DRight)) pads[0].buttons |= 0x0002;
+    if (down(PadControl::StickUp)) pads[0].stick_y = 127;
+    if (down(PadControl::StickDown)) pads[0].stick_y = -128;
+    if (down(PadControl::StickRight)) pads[0].stick_x = 127;
+    if (down(PadControl::StickLeft)) pads[0].stick_x = -128;
+    if (down(PadControl::CUp)) pads[0].substick_y = 127;
+    if (down(PadControl::CDown)) pads[0].substick_y = -128;
+    if (down(PadControl::CRight)) pads[0].substick_x = 127;
+    if (down(PadControl::CLeft)) pads[0].substick_x = -128;
 }
 
 } 

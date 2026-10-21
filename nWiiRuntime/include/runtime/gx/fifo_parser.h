@@ -47,6 +47,10 @@ public:
     // Decode a deferred draw's raw bytes into cmd.vertices using the state
     // snapshotted at parse time. No-op if already decoded or not a draw.
     static void DecodeDraw(GXCommand& cmd);
+    // cached_normal: XF's latched normal before this draw, updated to the
+    // value after it (lit vertices without a normal reuse it). Draws with a
+    // normal attribute don't read it, so they can be decoded in parallel.
+    static void DecodeDraw(GXCommand& cmd, float cached_normal[3]);
 };
 
 } 

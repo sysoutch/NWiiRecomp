@@ -1,6 +1,14 @@
 #include "runtime/texture_cache_gl.h"
 #include <iostream>
 #include <cstring>
+#include <vector>
+#include <cstdlib>
+#include <cstdio>
+#include <algorithm>
+
+namespace nwii::runtime { extern MMU *g_mmu; }
+extern uint64_t g_drawlog_frame_req, g_stat_frames;
+using nwii::runtime::g_mmu;
 
 // GX texture decoding, kept bit-exact with Dolphin's TextureDecoder:
 
@@ -18,20 +26,43 @@ TextureCache& TextureCache::get() {
 
 void TextureCache::clear() {
     for (auto& pair : cache) {
-        glDeleteTextures(1, &pair.second);
+        glDeleteTextures(1, &pair.second.tex);
     }
     cache.clear();
     // efb_textures deliberately survive: their GL objects are owned by the
     // renderer's copy path and re-filled every EFB copy.
 }
 
-void TextureCache::register_efb_texture(uint32_t addr, GLuint tex) {
-    efb_textures[addr & 0x01FFFFFF] = tex;
+// 256 words spread over the region: cheap, and any real reuse of the memory
+// (a file loaded over it) changes them.
+static uint32_t ram_sample_hash(uint32_t addr, uint32_t bytes) {
+    uint32_t h = 2166136261u;
+    if (!g_mmu || bytes < 4) return h;
+    const uint8_t *p = g_mmu->get_ptr(0x80000000u | (addr & 0x01FFFFFF));
+    if (!p) return h;
+    const uint32_t stride = std::max<uint32_t>(4, (bytes / 256) & ~3u);
+    for (uint32_t off = 0; off + 4 <= bytes; off += stride) {
+        uint32_t w;
+        std::memcpy(&w, p + off, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    return h;
 }
 
-GLuint TextureCache::find_efb_texture(uint32_t addr) const {
+void TextureCache::register_efb_texture(uint32_t addr, GLuint tex, uint32_t bytes) {
+    addr &= 0x01FFFFFF;
+    efb_textures[addr] = {tex, bytes, ram_sample_hash(addr, bytes)};
+}
+
+GLuint TextureCache::find_efb_texture(uint32_t addr) {
     auto it = efb_textures.find(addr & 0x01FFFFFF);
-    return it == efb_textures.end() ? 0 : it->second;
+    if (it == efb_textures.end()) return 0;
+    if (ram_sample_hash(it->first, it->second.bytes) != it->second.ram_hash) {
+        glDeleteTextures(1, &it->second.tex);
+        efb_textures.erase(it);
+        return 0;
+    }
+    return it->second.tex;
 }
 
 // 5/6/4/3-bit channel expansion, matching Dolphin's ConvertNTo8 tables.
@@ -61,9 +92,62 @@ uint32_t texture_data_size(uint32_t width, uint32_t height, uint32_t format) {
     return wt * ht * tw * th * bpp / 8;
 }
 
+// NWII_TEXDUMP_ADDR=<hexaddr>:<file>: the first time a stage samples that
+// address, write the GL texture it gets (RGBA8, level 0) to <file>, plus a
+// line on stdout saying whether it was an EFB copy or a RAM decode.
+static void maybe_dump_texture(const gx::TexStage& stage, GLuint tex, const char* kind) {
+    static const char* env = std::getenv("NWII_TEXDUMP_ADDR");
+    static bool done = false;
+    if (!env || done) return;
+    const uint32_t want = (uint32_t)std::strtoul(env, nullptr, 16);
+    if ((stage.base_addr & 0x01FFFFFF) != (want & 0x01FFFFFF)) return;
+    // NWII_TEXDUMP_FROM=<frame>: ignore uses before that game frame.
+    static const char* from = std::getenv("NWII_TEXDUMP_FROM");
+    if (from && g_stat_frames < std::strtoull(from, nullptr, 10)) return;
+    done = true;
+    const char* path = std::strchr(env, ':');
+    GLint w = 0, h = 0;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    std::printf("[TEXDUMP] %08X %s fmt=%u %ux%u gl=%dx%d id=%u\n", stage.base_addr, kind,
+                stage.format, stage.width, stage.height, w, h, tex);
+    // Draw-log the rest of this frame too (with NWII_TEXDUMP: bound textures).
+    g_drawlog_frame_req = g_stat_frames;
+    if (path && w > 0 && h > 0) {
+        std::vector<unsigned char> buf((size_t)w * h * 4);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        if (FILE* f = std::fopen(path + 1, "wb")) {
+            std::fwrite(buf.data(), 1, buf.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
+// Drops the least recently used quarter of the cache. Clearing everything at
+// 512 entries made busy scenes re-decode and re-upload every texture in the
+// following frames -- visible hitches while moving through a level.
+void TextureCache::evict_lru() {
+    std::vector<std::pair<uint64_t, TextureKey>> v;
+    v.reserve(cache.size());
+    for (const auto& [k, e] : cache) v.push_back({e.last_use, k});
+    const size_t drop = v.size() / 4;
+    std::nth_element(v.begin(), v.begin() + drop, v.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < drop; ++i) {
+        auto it = cache.find(v[i].second);
+        glDeleteTextures(1, &it->second.tex);
+        cache.erase(it);
+    }
+    static const bool stat = std::getenv("NWII_TEXSTAT") != nullptr;
+    if (stat) std::printf("[TEXSTAT] evicted %zu of %zu textures\n", drop, v.size());
+}
+
 GLuint TextureCache::get_texture(CPUContext& ctx, const gx::TexStage& stage) {
-    if (GLuint efb = find_efb_texture(stage.base_addr))
+    if (GLuint efb = find_efb_texture(stage.base_addr)) {
+        maybe_dump_texture(stage, efb, "efb-copy");
         return efb;
+    }
     uint32_t size = texture_data_size(stage.width, stage.height, stage.format);
     uint32_t stride = size > 32 * 4096 ? size / 4096 : 32;
     uint32_t hash = 2166136261u;
@@ -112,22 +196,29 @@ GLuint TextureCache::get_texture(CPUContext& ctx, const gx::TexStage& stage) {
                       stage.format, stage.tlut_offset, stage.tlut_format, hash};
     auto it = cache.find(key);
     if (it != cache.end()) {
-        return it->second;
+        it->second.last_use = ++use_counter;
+        maybe_dump_texture(stage, it->second.tex, "cached");
+        return it->second.tex;
     }
 
-    if (cache.size() > 512)
-        clear();
+    if (cache.size() >= 2048)
+        evict_lru();
 
+    extern uint32_t g_hitch_texdecodes;
+    ++g_hitch_texdecodes;
     Image img = decode_texture(ctx, stage);
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, stage.width, stage.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data);
+    // Mip chain for trilinear/anisotropic sampling (see ApplySamplerMode).
+    glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     UnloadImage(img);
 
-    cache[key] = tex;
+    cache[key] = Entry{tex, ++use_counter};
+    maybe_dump_texture(stage, tex, "decoded");
     return tex;
 }
 
