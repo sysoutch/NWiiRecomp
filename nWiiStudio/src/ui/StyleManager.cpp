@@ -85,9 +85,9 @@ void ApplyDarkTheme() {
     colors[ImGuiCol_FrameBgActive]          = ImVec4(0.24f, 0.24f, 0.25f, 1.00f);
     colors[ImGuiCol_Tab]                    = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
     colors[ImGuiCol_TabHovered]             = bgPanel;
-    colors[ImGuiCol_TabActive]              = bgPanel;
-    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
-    colors[ImGuiCol_TabUnfocusedActive]     = bgPanel;
+    colors[ImGuiCol_TabSelected]            = bgPanel;
+    colors[ImGuiCol_TabDimmed]              = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
+    colors[ImGuiCol_TabDimmedSelected]      = bgPanel;
     colors[ImGuiCol_DockingPreview]         = accentMain;
     colors[ImGuiCol_DockingEmptyBg]         = bgBase;
     colors[ImGuiCol_TextSelectedBg]         = ImVec4(0.00f, 0.48f, 0.80f, 0.40f);
@@ -136,9 +136,9 @@ void ApplyLightTheme() {
     colors[ImGuiCol_FrameBgActive]          = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
     colors[ImGuiCol_Tab]                    = ImVec4(0.76f, 0.80f, 0.84f, 0.93f);
     colors[ImGuiCol_TabHovered]             = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
-    colors[ImGuiCol_TabActive]              = ImVec4(0.60f, 0.73f, 0.88f, 1.00f);
-    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.92f, 0.93f, 0.94f, 0.98f);
-    colors[ImGuiCol_TabUnfocusedActive]     = ImVec4(0.74f, 0.82f, 0.91f, 1.00f);
+    colors[ImGuiCol_TabSelected]            = ImVec4(0.60f, 0.73f, 0.88f, 1.00f);
+    colors[ImGuiCol_TabDimmed]              = ImVec4(0.92f, 0.93f, 0.94f, 0.98f);
+    colors[ImGuiCol_TabDimmedSelected]      = ImVec4(0.74f, 0.82f, 0.91f, 1.00f);
     colors[ImGuiCol_DockingPreview]         = accentMain;
     colors[ImGuiCol_DockingEmptyBg]         = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
     colors[ImGuiCol_TextSelectedBg]         = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
@@ -203,9 +203,9 @@ void ApplyNintendoTheme() {
     
     colors[ImGuiCol_Tab]                    = ImVec4(0.12f, 0.11f, 0.16f, 1.00f);
     colors[ImGuiCol_TabHovered]             = accentHover;
-    colors[ImGuiCol_TabActive]              = accentMain;
-    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.09f, 0.08f, 0.13f, 1.00f);
-    colors[ImGuiCol_TabUnfocusedActive]     = ImVec4(0.22f, 0.10f, 0.40f, 1.00f);
+    colors[ImGuiCol_TabSelected]            = accentMain;
+    colors[ImGuiCol_TabDimmed]              = ImVec4(0.09f, 0.08f, 0.13f, 1.00f);
+    colors[ImGuiCol_TabDimmedSelected]      = ImVec4(0.22f, 0.10f, 0.40f, 1.00f);
     
     colors[ImGuiCol_DockingPreview]         = accentMain;
     colors[ImGuiCol_DockingEmptyBg]         = bgBase;

@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Fetched dependencies (e.g. glad v0.1.36) declare cmake_minimum_required
+# below 3.5, which CMake 4 rejects; configure them with 3.5 policies instead.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 include(FetchContent)
 
 # Dolphin SDK signature database (GPLv2+ data from dolphin-emu, referenced by

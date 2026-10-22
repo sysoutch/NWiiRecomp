@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Fetched dependencies (e.g. glad v0.1.36) declare cmake_minimum_required
+# below 3.5, which CMake 4 rejects; configure them with 3.5 policies instead.
+# (Repeated here for projects that add the runtime directly.)
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 include(FetchContent)
 
 # GLAD GL loader: use the vendored copy when present, otherwise fetch the
