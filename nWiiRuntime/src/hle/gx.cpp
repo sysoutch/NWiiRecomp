@@ -218,7 +218,7 @@ static void ParseGXFifoIntoCarry() {
         // Draws with their own normals are independent of each other and are
         // decoded in parallel (decode was half of this thread's time).
         // NWII_PAR_DECODE=0: sequential.
-        static const bool par = [] {
+        [[maybe_unused]] static const bool par = [] {
             const char *e = std::getenv("NWII_PAR_DECODE");
             return !(e && e[0] == '0');
         }();
@@ -232,10 +232,13 @@ static void ParseGXFifoIntoCarry() {
             float unused[3] = {0.0f, 0.0f, 0.0f};
             gxn::FifoParser::DecodeDraw(*c, unused);
         };
+#if defined(__cpp_lib_parallel_algorithm)
         if (par && with_normals.size() >= 32)
             std::for_each(std::execution::par, with_normals.begin(), with_normals.end(),
                           decode_own);
         else
+#endif
+            // (Sequential where the library has no parallel algorithms, e.g. Apple's libc++.)
             std::for_each(with_normals.begin(), with_normals.end(), decode_own);
         // Then in stream order: XF's latched normal carries over to draws
         // without a normal attribute (Dolphin's "cached normal").
