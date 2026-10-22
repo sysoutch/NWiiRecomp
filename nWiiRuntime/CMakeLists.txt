@@ -148,6 +148,13 @@ if(APPLE)
     target_sources(nwiiruntime PRIVATE src/hle/gx/renderer_metal.mm)
 endif()
 
+# Apple clang 21 (Xcode 26) never finishes optimising hw_ax.cpp at -O3: its
+# loop unroller hangs (CI hit the 6-hour limit). -O2, or -O3 with
+# -fno-unroll-loops, compile it in about a second.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    set_source_files_properties(src/hw/hw_ax.cpp PROPERTIES COMPILE_OPTIONS -fno-unroll-loops)
+endif()
+
 target_include_directories(nwiiruntime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
