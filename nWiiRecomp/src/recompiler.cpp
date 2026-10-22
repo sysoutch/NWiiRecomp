@@ -321,6 +321,8 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
     // declare them all (a repeated identical declaration is harmless).
     for (const auto &[addr, name] : config_.hle_hooks)
       hout << "void " << name << "(nwii::runtime::CPUContext& ctx);\n";
+    for (const auto &[addr, name] : config_.hle_post_hooks)
+      hout << "void " << name << "(nwii::runtime::CPUContext& ctx, const unsigned int* args);\n";
     hout << "}\n";
 
     std::set<std::string> emitted_names;
@@ -713,10 +715,24 @@ std::string Recompiler::generate_function_cpp(const analyzer::Function &func) {
 void Recompiler::emit_function(std::ostream &out,
                                const analyzer::Function &func,
                                const std::string &func_name) {
-  // NWII_RESTRICT (__restrict where supported): guest RAM stores go through
-  // byte pointers, so without it the compiler reloads guest registers from
-  // ctx after every store. Calls that receive ctx still reload as usual.
-  out << "void " << func_name << "(CPUContext& NWII_RESTRICT ctx) {\n";
+  // [hle_post_hooks]: the recompiled body goes into <name>_body, and <name>
+  // calls it and then the native with the entry arguments.
+  auto post = config_.hle_post_hooks.find(func.start_address);
+  if (post != config_.hle_post_hooks.end()) {
+    out << "static void " << func_name << "_body(CPUContext& NWII_RESTRICT ctx);\n";
+    out << "void " << func_name << "(CPUContext& NWII_RESTRICT ctx) {\n";
+    out << "    unsigned int args[8];\n";
+    out << "    for (int i = 0; i < 8; ++i) args[i] = ctx.gpr[3 + i];\n";
+    out << "    " << func_name << "_body(ctx);\n";
+    out << "    " << post->second << "(ctx, args);\n";
+    out << "}\n\n";
+    out << "static void " << func_name << "_body(CPUContext& NWII_RESTRICT ctx) {\n";
+  } else {
+    // NWII_RESTRICT (__restrict where supported): guest RAM stores go through
+    // byte pointers, so without it the compiler reloads guest registers from
+    // ctx after every store. Calls that receive ctx still reload as usual.
+    out << "void " << func_name << "(CPUContext& NWII_RESTRICT ctx) {\n";
+  }
 
 
 

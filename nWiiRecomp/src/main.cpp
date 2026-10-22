@@ -37,6 +37,15 @@ int main(int argc, char** argv) {
             }
             std::cout << "Loaded " << config.hle_hooks.size() << " HLE hooks from config.\n";
         }
+        if (auto hooks = tbl["hle_post_hooks"].as_table()) {
+            for (const auto& [key, val] : *hooks) {
+                uint32_t addr = (uint32_t)std::stoul(std::string(key.str()), nullptr, 16);
+                std::string name = val.value_or(std::string());
+                if (addr != 0 && !name.empty())
+                    config.hle_post_hooks[addr] = name;
+            }
+            std::cout << "Loaded " << config.hle_post_hooks.size() << " HLE post hooks from config.\n";
+        }
 
         
         if (auto arr = tbl["rel_aot"].as_array()) {

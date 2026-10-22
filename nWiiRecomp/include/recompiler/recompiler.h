@@ -37,6 +37,10 @@ struct RecompilerConfig {
     
 
     std::map<uint32_t, std::string> hle_hooks;
+    // [hle_post_hooks]: the function runs as recompiled, then the named
+    // native is called as name(ctx, args) with args = r3..r10 at entry
+    // (to adjust what the function produced).
+    std::map<uint32_t, std::string> hle_post_hooks;
 
     
 
