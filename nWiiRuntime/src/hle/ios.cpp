@@ -817,6 +817,7 @@ static uint64_t s_vi_due = 0;    // timebase the pending retrace fires at
 // must not delay the next one.
 static uint64_t s_vi_frame_retrace = 0;
 static bool s_vi_frame_open = false; // frame ended, its retrace not fired yet
+static uint64_t s_vi_paced = 0;      // steady-pacing period last used (NWII_FRAMEHIST)
 // Recent frame work times (from the retrace that released a frame to that
 // frame's GXDrawDone), for the steady pacing below. Work, not the paced
 // period, or the pacing would feed on itself and never speed up again.
@@ -851,6 +852,24 @@ static void vi_fire(CPUContext &c, uint64_t) {
     ++g_vi_fired_total;
     s_vi_last = nwii::runtime::EventScheduler::get().now();
     if (s_vi_frame_open) {
+        // NWII_FRAMEHIST=1 also: frame START intervals (retrace that releases
+        // the game to retrace that releases the next frame), 1 ms buckets,
+        // every 5 s -- the game reads its clock there, so this spread is
+        // what moving objects step by.
+        static const bool hist = std::getenv("NWII_FRAMEHIST") != nullptr;
+        if (hist && s_vi_frame_retrace) {
+            static uint32_t b[32] = {};
+            static uint64_t t0 = s_vi_last;
+            ++b[std::min<uint64_t>(31, (s_vi_last - s_vi_frame_retrace) * 1000 / c.tb_freq)];
+            if (s_vi_last - t0 >= c.tb_freq * 5) {
+                t0 = s_vi_last;
+                std::printf("[STARTHIST] period %.2fms |", s_vi_paced * 1000.0 / c.tb_freq);
+                for (int i = 0; i < 32; ++i)
+                    if (b[i]) std::printf(" %dms:%u", i, b[i]);
+                std::printf("\n");
+                std::fill(std::begin(b), std::end(b), 0u);
+            }
+        }
         s_vi_frame_retrace = s_vi_last;
         s_vi_frame_open = false;
     }
@@ -879,7 +898,10 @@ static void vi_fire(CPUContext &c, uint64_t) {
             fired = delivered = why_cb = why_pending = why_ctx = 0;
         }
     }
-    vi_schedule_at(s_vi_last + s_vi_period);
+    // While steady pacing holds frames apart, the free-running retraces
+    // follow the paced period too: an 8.3 ms one landing mid-frame (or before
+    // the paced one) let the game start its next frame early.
+    vi_schedule_at(s_vi_last + std::max(s_vi_period, s_vi_paced));
 }
 
 // Adaptive retrace (NWII_VI_ADAPTIVE=0 turns it off): called from the
@@ -923,25 +945,30 @@ void vi_request_retrace(CPUContext &ctx) {
     if (s_vi_frame_retrace && !s_vi_frame_open)
         s_vi_hist[s_vi_hist_n++ % 32] = ctx.read_timebase() - s_vi_frame_retrace;
     s_vi_frame_open = true;
-    // Steady pacing (NWII_VI_STEADY=0 off; only above 60 Hz): frame times at
-    // the 120 setting swing between ~8 and ~14 ms with the scene, and the
-    // swing itself reads as stutter while turning. The next frame starts no
-    // earlier than the 80th percentile of the last 32 frames' work -- a few
-    // fps less on average, evenly spaced.
-    static const bool steady = [] {
+    // Steady pacing (only above 60 Hz): frame times at the 120 setting swing
+    // between ~8 and ~14 ms with the scene. The game moves each frame by the
+    // PREVIOUS frame's measured time, so every swing shows up as a step that
+    // doesn't match the frame it is displayed in: fast motion (charging)
+    // shakes. The next frame starts no earlier than the 31st-fastest of the
+    // last 32 frames' work (NWII_VI_STEADY=<0-31> picks the rank, 0 = off;
+    // the 80th percentile, rank 25, still left charging visibly shaky) --
+    // fewer fps where frames vary, evenly spaced.
+    static const int steady_rank = [] {
         const char *e = std::getenv("NWII_VI_STEADY");
-        return !(e && e[0] == '0');
+        return e ? std::clamp(std::atoi(e), 0, 31) : 30;
     }();
     uint64_t period = s_vi_period;
-    if (steady && vi_target_hz() > 60 && s_vi_hist_n >= 32) {
+    if (steady_rank > 0 && vi_target_hz() > 60 && s_vi_hist_n >= 32) {
         uint64_t v[32];
         std::copy(std::begin(s_vi_hist), std::end(s_vi_hist), v);
-        std::nth_element(v, v + 25, v + 32);
-        period = std::clamp<uint64_t>(v[25], s_vi_period, ctx.tb_freq / 30);
+        std::nth_element(v, v + steady_rank, v + 32);
+        period = std::clamp<uint64_t>(v[steady_rank], s_vi_period, ctx.tb_freq / 30);
     }
+    s_vi_paced = period;
     const uint64_t soon = ctx.read_timebase() + ctx.tb_freq * 3 / 10000;
     const uint64_t due = std::max(soon, s_vi_frame_retrace + period);
-    if (due < s_vi_due) vi_schedule_at(due);
+    // Paced: this retrace replaces a pending earlier one too.
+    if (due < s_vi_due || period > s_vi_period) vi_schedule_at(due);
 }
 
 void GX_WGPIPE_Flush(); // gx.cpp: gather-pipe staging -> FIFO

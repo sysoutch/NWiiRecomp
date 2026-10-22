@@ -1,6 +1,7 @@
 #include "runtime/efb.h"
 #include "runtime/config.h"
 #include <algorithm>
+#include <atomic>
 #include "runtime/cpu_context.h"
 #include "runtime/gx/fifo_parser.h"
 #include "runtime/gx/renderer.h"
@@ -25,6 +26,10 @@ void GX_GetClearColor(unsigned char rgba[4]);
 extern uint64_t g_stat_frames;
 // Frame set by the host (main.cpp NWII_PURPLE_TRIGGER) to draw-log on demand.
 uint64_t g_drawlog_frame_req = ~0ull;
+// PE_CMODE0 value whose draws are dropped (-1: none); see NWII_SKIP_CMODE.
+std::atomic<int> g_skip_cmode{-1};
+// Native screen pixel the draw log samples after every draw (-1: default).
+std::atomic<int> g_probe_x{-1}, g_probe_y{-1};
 
 namespace nwii::runtime::gx {
 
@@ -363,6 +368,9 @@ static void FlushBatch() {
 }
 
 bool g_game_anamorphic = false; // game renders 16:9 squeezed into 4:3 (main.cpp)
+// Current projection (perspective? anamorphic?) and this frame's draws per kind.
+static bool s_proj_persp = false, s_proj_anamorphic = false;
+static uint64_t s_ana_draws = 0, s_std_draws = 0;
 } // namespace nwii::runtime::gx
 uint32_t g_hitch_compiles = 0, g_hitch_texdecodes = 0; // NWII_HITCHLOG (gx.cpp)
 namespace nwii::runtime::gx {
@@ -990,6 +998,18 @@ static void DrawPrimitive(const GXCommand &cmd) {
         printf(" [%d] tg=%05X mtx=%d tc=%.3f,%.3f,%.3f", i, (uint32_t)g_state.xf[0x040 + i],
                (int)a.texMtxIdx[i], tc[i][0], tc[i][1], tc[i][2]);
       printf(" | raw tex1=%d:%.2f,%.2f\n", (int)a.has_tex[1], a.tex[1][0], a.tex[1][1]);
+      // Dual texgen: enable bit, each texgen's post matrix (index, normalise,
+      // rows) -- a zero matrix here maps every vertex to its offset.
+      printf("           dual=%u", (unsigned)(g_state.xf[0x012] & 1));
+      for (int i = 0; i < (int)g_state.numTexGens && i < 8; ++i) {
+        const uint32_t pt = g_state.xf[0x050 + i];
+        printf(" | post[%d]=%03X", i, pt);
+        if ((pt & 0x3F) * 4 + 12 <= 256) {
+          const float *p = &g_state.postMatrices[(pt & 0x3F) * 4];
+          for (int k = 0; k < 12; ++k) printf("%s%.3f", k % 4 ? " " : (k ? " / " : " "), p[k]);
+        }
+      }
+      printf("\n");
     }
     printf("           norm=%d:%.2f,%.2f,%.2f vcd=%08X,%08X", (int)a.has_norm,
            a.norm[0], a.norm[1], a.norm[2], g_state.cp[0x50], g_state.cp[0x60]);
@@ -1047,11 +1067,15 @@ static void DrawPrimitive(const GXCommand &cmd) {
   }
   if (s_skip_draw)
     return; // shader for this state not ready yet
-  // NWII_SKIP_CMODE=<hex>: drop draws with that PE_CMODE0 (bisecting effects).
-  static const int skip_cmode = [] {
-    const char *e = std::getenv("NWII_SKIP_CMODE");
-    return e ? (int)std::strtoul(e, nullptr, 16) : -1;
+  // NWII_SKIP_CMODE=<hex> (or NWII_CTRL "skipcmode <hex>|off" at run time):
+  // drop draws with that PE_CMODE0 (bisecting effects).
+  static const bool skip_init = [] {
+    if (const char *e = std::getenv("NWII_SKIP_CMODE"))
+      g_skip_cmode = (int)std::strtoul(e, nullptr, 16);
+    return true;
   }();
+  (void)skip_init;
+  const int skip_cmode = g_skip_cmode.load(std::memory_order_relaxed);
   if (skip_cmode >= 0 && (int)g_state.bp[0x41] == skip_cmode)
     return;
   EmitPrimitive(cmd);
@@ -1092,7 +1116,13 @@ static void DrawPrimitive(const GXCommand &cmd) {
     GLboolean mask[4];
     glGetBooleanv(GL_COLOR_WRITEMASK, mask);
     unsigned char px[3][4] = {};
-    const int pts[3][2] = {{320, 240}, {100, 100}, {540, 380}};
+    int pts[3][2] = {{320, 240}, {100, 100}, {540, 380}};
+    // NWII_CTRL "probe <x> <y>": the third sample is that native screen pixel
+    // (top-left origin) -- which draw paints a given spot.
+    if (g_probe_x >= 0) {
+      pts[2][0] = g_probe_x;
+      pts[2][1] = (int)((nwii::runtime::efb::height - 1) / nwii::runtime::efb::sy) - g_probe_y;
+    }
     nwii::runtime::efb::resolve();
     glBindFramebuffer(GL_READ_FRAMEBUFFER, nwii::runtime::efb::read_fbo());
     for (int i = 0; i < 3; ++i)
@@ -1734,8 +1764,12 @@ public:
           // The game's anamorphic "Widescreen 16:9" mode (see WidescreenWanted):
           // the presenter stretches the picture to 16:9 even without our
           // widescreen option, like a widescreen TV would.
-          if (g_state.projType == 0 && g_state.projection[0] > 0.0f)
-            g_game_anamorphic = g_state.projection[2] / g_state.projection[0] > 1.5f;
+          // Only a vote: render-to-texture passes (atlas pages, shadows) load
+          // their own projections, and taking the last one loaded flipped
+          // the presented aspect for single frames (4:3 menus flickered).
+          s_proj_persp = g_state.projType == 0 && g_state.projection[0] > 0.0f;
+          if (s_proj_persp)
+            s_proj_anamorphic = g_state.projection[2] / g_state.projection[0] > 1.5f;
           ApplyProjection(s_active_shader.uProjMtx);
         }
       } else if (cmd.type == GXCommandType::BPRegister) {
@@ -1834,8 +1868,22 @@ public:
           if (xfb_log)
             printf("[XFBDRAWS] dest=%08X draws_since_clear=%llu clear=%d\n", g_state.efbCopyDest,
                    (unsigned long long)s_draws_since_clear, (cmd.val & 0x800) ? 1 : 0);
-          if (xfb_all || s_draws_since_clear > 0)
+          if (xfb_all || s_draws_since_clear > 0) {
             efb::snapshot(g_state.efbCopyDest);
+            // Anamorphic display: the projection most of this frame's 3D
+            // draws used, changing only after 10 frames in a row agree.
+            if (s_ana_draws + s_std_draws > 0) {
+              const bool want = s_ana_draws > s_std_draws;
+              static int streak = 0;
+              streak = want != g_game_anamorphic ? streak + 1 : 0;
+              if (streak >= 10) {
+                g_game_anamorphic = want;
+                streak = 0;
+                if (xfb_log) printf("[ANAMORPHIC] %d\n", want ? 1 : 0);
+              }
+            }
+            s_ana_draws = s_std_draws = 0;
+          }
           if (cmd.val & 0x800) s_draws_since_clear = 0;
           static const bool old_clear = std::getenv("NWII_OLDCLEAR") != nullptr;
           if ((cmd.val & 0x800) && !old_clear) {
@@ -1857,6 +1905,7 @@ public:
         }
       } else if (cmd.type == GXCommandType::DrawPrimitive) {
         ++s_draws_since_clear;
+        if (s_proj_persp) ++(s_proj_anamorphic ? s_ana_draws : s_std_draws);
         if (!s_batch_open && g_ctx_ptr) {
           for (int i = 0; i < 8; ++i) {
             const auto &stage = g_state.texStages[i];

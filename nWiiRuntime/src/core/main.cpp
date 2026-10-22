@@ -11,6 +11,7 @@
 #include "runtime/virtual_disc.h"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -494,31 +495,102 @@ int main(int argc, char **argv) {
     if (audio_dev > 0) SDL_PauseAudioDevice(audio_dev, 0);
   }
 
-  // Audio feeder thread: keeps ~100 ms queued on the host device, taking
+  // Audio feeder thread: keeps a cushion (80-250 ms) queued on the host device, taking
   // only what the game's audio DMA has produced. It used to run in the
   // present loop and always queued 1024 frames, padding with zeros whenever
   // the game was momentarily behind -- inserted silence that crackled, mostly
   // around camera cuts (dialogue start/end) where rendering or the game thread
   // stall for a moment.
+  // The game produces exactly real time, so the queue only holds whatever
+  // cushion it was given: feeding each block as it arrived kept it near
+  // 0 ms, and every 32 ms device pull came up short and was padded with
+  // silence (voice stutter, worse at high frame rates). So playback starts,
+  // and restarts after the queue runs dry, only once prime_frames are
+  // waiting.
   std::atomic<bool> audio_stop{false};
   std::thread audio_thread;
   if (audio_dev > 0) {
     audio_thread = std::thread([&audio_stop, audio_dev] {
-      constexpr Uint32 kTargetBytes = 3200 * 4; // 100 ms at 32 kHz stereo s16
-      static int16_t abuf[1024 * 2];
+      // 32 kHz stereo s16: 32 frames per ms. Queue target = cushion + 40 ms.
+      constexpr size_t kHeadroomFrames = 1280;  // 40 ms
+      constexpr size_t kMaxPrimeFrames = 8000;  // 250 ms
+      size_t prime_frames = 2560;               // 80 ms, grows on each dry run
+      bool priming = true;
+      static int16_t abuf[1024 * 2], tbuf[1032 * 2];
+      double trim_acc = 0.0;
+      // NWII_AUDIOSTAT=1: once a second, the frames the game produced, the
+      // lowest host queue level and how often the queue ran dry.
+      const bool stat = std::getenv("NWII_AUDIOSTAT") != nullptr;
+      auto stat_t0 = std::chrono::steady_clock::now();
+      size_t stat_frames = 0, stat_dry = 0;
+      Uint32 stat_min = ~0u;
+      bool was_dry = true;
       while (!audio_stop.load(std::memory_order_relaxed)) {
         const Uint32 queued = SDL_GetQueuedAudioSize(audio_dev);
-        if (queued < kTargetBytes) {
+        if (stat) {
+          stat_min = std::min(stat_min, queued);
+          if (queued == 0 && !was_dry) ++stat_dry;
+          was_dry = queued == 0;
+          const auto t = std::chrono::steady_clock::now();
+          if (t - stat_t0 >= std::chrono::seconds(1)) {
+            std::cout << "[AudioStat] produced=" << stat_frames << " min_queued_ms="
+                      << stat_min / 128 << " dry=" << stat_dry << std::endl;
+            stat_t0 = t;
+            stat_frames = stat_dry = 0;
+            stat_min = ~0u;
+          }
+        }
+        // Ran dry: the game stalled for longer than the cushion (level loads,
+        // the first seconds of a level). Each time, wait for 1.5x more before
+        // resuming (up to kMaxPrimeFrames), so a stalling stretch gives one
+        // longer gap instead of crackling on every stall.
+        if (queued == 0 && !priming) {
+          priming = true;
+          prime_frames = std::min(prime_frames * 3 / 2, kMaxPrimeFrames);
+        }
+        if (priming && nwii::runtime::hw::dsp_audio_available() >= prime_frames)
+          priming = false;
+        const Uint32 target_bytes = (Uint32)(prime_frames + kHeadroomFrames) * 4;
+        if (!priming && queued < target_bytes) {
           const size_t want_frames =
-              std::min<size_t>(1024, (kTargetBytes - queued) / 4);
+              std::min<size_t>(1024, (target_bytes - queued) / 4);
           const size_t got = nwii::runtime::hw::dsp_audio_take(abuf, want_frames);
+          stat_frames += got;
           if (got) {
+            // Clock drift: the game's 32 kHz (wall clock) and the device's
+            // differ slightly, which slowly drained the cushion (~35 ms in
+            // 80 s). Below 3/4 of it, stretch by 0.2%; with more than 80 ms
+            // still waiting after this take (the game ahead), shrink: an
+            // extra or dropped frame every ~500, spread over the chunk by
+            // linear interpolation so first and last frames stay.
+            const int16_t *out = abuf;
+            size_t n = got;
+            const int trim = queued < prime_frames * 3 ? 1
+                           : nwii::runtime::hw::dsp_audio_available() > 2 * kHeadroomFrames ? -1 : 0;
+            trim_acc += trim * got / 500.0;
+            const long extra = std::lround(trim_acc);
+            if (extra != 0 && got > 2) {
+              trim_acc -= extra;
+              n = got + extra;
+              for (size_t i = 0; i < n; ++i) {
+                const double pos = (double)i * (got - 1) / (n - 1);
+                const size_t k = std::min((size_t)pos, got - 2);
+                const double f = pos - k;
+                for (int ch = 0; ch < 2; ++ch)
+                  tbuf[i * 2 + ch] = (int16_t)std::lround(abuf[k * 2 + ch] * (1 - f) +
+                                                          abuf[(k + 1) * 2 + ch] * f);
+              }
+              out = tbuf;
+            }
             // [audio] volume / mute from the settings overlay.
             const auto &acfg = nwii::runtime::Config::get();
             const int vol = acfg.mute ? 0 : acfg.volume;
-            if (vol < 100)
-              for (size_t i = 0; i < got * 2; ++i) abuf[i] = (int16_t)(abuf[i] * vol / 100);
-            SDL_QueueAudio(audio_dev, abuf, (Uint32)(got * 4));
+            if (vol < 100) {
+              if (out == abuf) std::copy(abuf, abuf + n * 2, tbuf);
+              for (size_t i = 0; i < n * 2; ++i) tbuf[i] = (int16_t)(tbuf[i] * vol / 100);
+              out = tbuf;
+            }
+            SDL_QueueAudio(audio_dev, out, (Uint32)(n * 4));
             continue;
           }
         }
@@ -1212,6 +1284,19 @@ int main(int argc, char **argv) {
                   g_drawlog_frame_req = g_stat_frames + 1;
                   std::printf("[CTRL] draw log for frame %llu\n",
                               (unsigned long long)g_drawlog_frame_req);
+                }
+                else if (n >= 2 && std::strcmp(cmd, "skipcmode") == 0) {
+                  // "skipcmode <hex>|off": drop draws with that PE_CMODE0.
+                  extern std::atomic<int> g_skip_cmode;
+                  g_skip_cmode = std::strcmp(name, "off") == 0 ? -1 : (int)std::strtoul(name, nullptr, 16);
+                  std::printf("[CTRL] skipcmode %s\n", name);
+                }
+                else if (n >= 2 && std::strcmp(cmd, "probe") == 0) {
+                  // "probe <x> <y>": the draw log's third pixel sample.
+                  extern std::atomic<int> g_probe_x, g_probe_y;
+                  g_probe_x = std::atoi(name);
+                  g_probe_y = ms;
+                  std::printf("[CTRL] probe %d,%d\n", g_probe_x.load(), g_probe_y.load());
                 }
                 else if (n >= 1 && std::strcmp(cmd, "shot") == 0)
                   ctrl_shot = true;

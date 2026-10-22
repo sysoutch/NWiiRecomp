@@ -35,6 +35,8 @@ void di_tick();
 size_t dsp_audio_pull(int16_t* out, size_t frames);
 // Like dsp_audio_pull, but returns only what was produced (no zero padding).
 size_t dsp_audio_take(int16_t* out, size_t frames);
+// Frames produced and not yet taken.
+size_t dsp_audio_available();
 void pe_signal_token(uint32_t token, bool raise_interrupt); 
 void pe_signal_finish();                                    
 

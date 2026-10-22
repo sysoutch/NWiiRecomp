@@ -56,7 +56,10 @@ std::vector<uint8_t> g_hw_fifo;
 static std::mutex g_dl_snap_mtx;
 // Shared, immutable buffers: the parser takes a reference instead of copying
 // every list again (that was ~45 MB/s in the hub).
-static std::map<uint64_t, std::shared_ptr<const std::vector<uint8_t>>> g_dl_snap;
+// Each entry carries the sequence number of its snapshot.
+struct DLSnap { std::shared_ptr<const std::vector<uint8_t>> buf; uint64_t seq; };
+static std::map<uint64_t, DLSnap> g_dl_snap;
+static uint64_t g_dl_snap_seq = 0;
 
 namespace nwii::runtime {
 void GX_DL_Snapshot(uint32_t addr, uint32_t size) {
@@ -68,15 +71,23 @@ void GX_DL_Snapshot(uint32_t addr, uint32_t size) {
     else
         for (uint32_t i = 0; i < size; ++i) buf[i] = nwii::runtime::g_mmu->read8(addr + i);
     std::lock_guard<std::mutex> lk(g_dl_snap_mtx);
-    if (g_dl_snap.size() > 1024) g_dl_snap.clear();
-    g_dl_snap[((uint64_t)(addr & 0x03FFFFFF) << 24) ^ size] = std::move(buf_ptr);
+    // Evict only old snapshots. Clearing the whole map (it did at 1024
+    // entries) also dropped lists the game had just called but the parser
+    // had not reached yet; those were then read from guest RAM already
+    // holding the next frame's list: the atlas/menu text lost its glyph
+    // positions from some point on every ~2 s (lists in a buffer that moves,
+    // ~8 new addresses per frame). The parser is at most a few frames behind.
+    if (g_dl_snap.size() > 1024)
+        for (auto it = g_dl_snap.begin(); it != g_dl_snap.end();)
+            it = it->second.seq + 512 < g_dl_snap_seq ? g_dl_snap.erase(it) : std::next(it);
+    g_dl_snap[((uint64_t)(addr & 0x03FFFFFF) << 24) ^ size] = {std::move(buf_ptr), ++g_dl_snap_seq};
 }
 
 std::shared_ptr<const std::vector<uint8_t>> GX_DL_Fetch(uint32_t addr, uint32_t size) {
     std::lock_guard<std::mutex> lk(g_dl_snap_mtx);
     auto it = g_dl_snap.find(((uint64_t)(addr & 0x03FFFFFF) << 24) ^ size);
-    if (it == g_dl_snap.end() || it->second->size() != size) return nullptr;
-    return it->second;
+    if (it == g_dl_snap.end() || it->second.buf->size() != size) return nullptr;
+    return it->second.buf;
 }
 } // namespace nwii::runtime
 

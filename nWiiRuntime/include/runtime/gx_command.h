@@ -13,10 +13,14 @@ enum class GXCommandType {
 };
 
 struct VertexData {
-    float pos[3];
-    float norm[3];
-    float color[4];
-    float tex[8][2];
+    // Zeroed: an XY-only position leaves z unwritten, and GX makes it 0.
+    // Left uninitialised it was stack garbage -- usually a stale value that
+    // happened to work, now and then NaN: the atlas/pause-menu text (2D
+    // glyph quads) vanished for single frames every couple of seconds.
+    float pos[3] = {0, 0, 0};
+    float norm[3] = {0, 0, 0};
+    float color[4] = {0, 0, 0, 0};
+    float tex[8][2] = {};
     // Untransformed (model-space) position and normal: texgen sources. The
     // normal is the XF-latched one when the vertex has none.
     float raw_pos[3] = {0, 0, 0};

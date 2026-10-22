@@ -108,6 +108,11 @@ size_t dsp_audio_take(int16_t* out, size_t frames) {
     return n;
 }
 
+size_t dsp_audio_available() {
+    std::lock_guard<std::mutex> lock(adma_mutex);
+    return adma_ring.size() / 2;
+}
+
 static void adma_event_cb(CPUContext& ctx, uint64_t late) {
     if (!(adma_control & 0x8000))
         return;
