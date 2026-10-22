@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(nWiiRecomp LANGUAGES C CXX)
+# The runtime's Metal renderer (.mm) and SDL/raylib's Cocoa sources: enabled
+# here so the compile rules exist in every directory, not only in theirs.
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

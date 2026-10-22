@@ -617,7 +617,9 @@ bool Recompiler::generate_cmake_project(uint32_t entry_point) {
   out << "cmake_minimum_required(VERSION 3.20)\n";
 
   
-  out << "project(" << config_.project_name << " LANGUAGES C CXX)\n\n";
+  out << "project(" << config_.project_name << " LANGUAGES C CXX)\n";
+  // The runtime's Metal renderer is Objective-C++; enable it project-wide.
+  out << "if(APPLE)\n    enable_language(OBJC OBJCXX)\nendif()\n\n";
   out << "set(CMAKE_POLICY_VERSION_MINIMUM 3.5)\n";
   out << "set(CMAKE_CXX_STANDARD 20)\n";
   out << "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n";
