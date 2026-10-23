@@ -15,6 +15,7 @@
 #include <glad/glad.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nwii::runtime {
@@ -1458,6 +1459,11 @@ static void EmitPrimitive(const GXCommand &cmd) {
 // sampled with different modes. The cache used to force GL_NEAREST, which
 // turned magnified glow/particle textures into hard blocks. No mip levels
 // are uploaded, so mip variants fall back to their base filter.
+// EFB-copy textures whose mip chain is out of date. Building it after every
+// copy cost a full-size downsample chain per copy and frame (at 3x, the copies
+// are up to 1920x1440) although the game almost always samples them unmipped.
+static std::unordered_set<GLuint> s_efb_mips_stale;
+
 static void ApplySamplerMode(int map) {
   const uint32_t m0 = g_state.bp[(map < 4 ? 0x80 : 0xA0) + (map & 3)];
   static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT,
@@ -1475,14 +1481,17 @@ static void ApplySamplerMode(int map) {
   // it as a thin streak ahead of Spyro while he charged.
   bool linear = m0 & 0x80;
   const uint32_t base = g_state.texStages[map].base_addr;
-  if (base && nwii::runtime::hle::TextureCache::get().find_efb_texture(base)) {
-    const int gx_min = (m0 >> 5) & 7; // 0/4 = no mips; 1,2,5,6 = mipmapped
-    const bool mips = gx_min == 1 || gx_min == 2 || gx_min == 5 || gx_min == 6;
-    if (!mips) {
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-      glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY */, 1.0f);
-      glGetError(); // anisotropy may be unsupported
-      return;
+  if (base) {
+    if (const GLuint efb_tex = nwii::runtime::hle::TextureCache::get().find_efb_texture(base)) {
+      const int gx_min = (m0 >> 5) & 7; // 0/4 = no mips; 1,2,5,6 = mipmapped
+      const bool mips = gx_min == 1 || gx_min == 2 || gx_min == 5 || gx_min == 6;
+      if (!mips) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY */, 1.0f);
+        glGetError(); // anisotropy may be unsupported
+        return;
+      }
+      if (s_efb_mips_stale.erase(efb_tex)) glGenerateMipmap(GL_TEXTURE_2D);
     }
   }
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -1498,11 +1507,240 @@ static void ApplySamplerMode(int map) {
                     linear ? aniso : 1.0f);
 }
 
+// The conversion ApplyEfbCopyFormat's CPU path does (2x2-native box filter,
+// shadow border reset, intensity, 4-bit quantisation), as GPU passes with the
+// same integer arithmetic. The CPU path reads the copy back with glReadPixels,
+// which waits for the GPU to finish everything queued so far -- Spyro's shadow
+// is such a copy every frame, so the render thread and the GPU took turns
+// instead of overlapping (worst on slow GPUs). Takes the raw copy from the
+// bound read framebuffer and the texture bound to GL_TEXTURE_2D, leaves the
+// result in that texture (ow x oh) and restores the GL state it touches.
+// NWII_EFBCONV_CPU=1 (or NWII_SHADOWSTAT, which needs the pixels) = CPU path.
+static bool EfbConvertGpu(uint32_t w, uint32_t h, bool half, bool four_bit,
+                          bool to_intensity, bool keep_alpha, bool efb_alpha) {
+  static const bool off = std::getenv("NWII_EFBCONV_CPU") || std::getenv("NWII_SHADOWSTAT");
+  static GLuint prog = 0, vao = 0, fbo = 0, src = 0, mid = 0, bg = 0;
+  static GLint uMode, uSrc, uBg, uBlock, uSrcSize, uBorder, uFourBit, uIntensity, uKeepAlpha,
+      uEfbAlpha;
+  static bool failed = false;
+  if (off || failed) return false;
+  if (!prog) {
+    static const char *vs = R"(#version 330 core
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+})";
+    // Modes: 0 box filter (uBlock source texels per output texel, partial
+    // blocks at the far edges as on the CPU), 1 the most common border texel
+    // (majority vote, exact plurality when there is no majority), 2 final:
+    // border reset, intensity, 4-bit. Values are handled as 0-255 integers.
+    static const char *fs = R"(#version 330 core
+uniform sampler2D uSrc;
+uniform sampler2D uBg;
+uniform int uMode;
+uniform ivec2 uBlock;
+uniform ivec2 uSrcSize;
+uniform int uBorder, uFourBit, uIntensity, uKeepAlpha, uEfbAlpha;
+out vec4 o;
+ivec4 fetch(ivec2 p) { return ivec4(texelFetch(uSrc, p, 0) * 255.0 + 0.5); }
+ivec2 border_texel(int i) {
+  if (i < 2 * uSrcSize.x) return ivec2(i >> 1, (i & 1) == 0 ? 0 : uSrcSize.y - 1);
+  i -= 2 * uSrcSize.x;
+  return ivec2((i & 1) == 0 ? 0 : uSrcSize.x - 1, 1 + (i >> 1));
+}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  if (uMode == 0) {
+    ivec4 sum = ivec4(0);
+    int n = 0;
+    ivec2 b = p * uBlock;
+    for (int y = b.y; y < min(uSrcSize.y, b.y + uBlock.y); ++y)
+      for (int x = b.x; x < min(uSrcSize.x, b.x + uBlock.x); ++x) {
+        sum += fetch(ivec2(x, y));
+        ++n;
+      }
+    o = vec4(n > 0 ? sum / n : ivec4(0)) / 255.0;
+    return;
+  }
+  if (uMode == 1) {
+    int n = 2 * uSrcSize.x + 2 * (uSrcSize.y - 2);
+    ivec4 cand = ivec4(0);
+    int c = 0;
+    for (int i = 0; i < n; ++i) {
+      ivec4 v = fetch(border_texel(i));
+      if (c == 0) { cand = v; c = 1; }
+      else if (v == cand) ++c;
+      else --c;
+    }
+    int cnt = 0;
+    for (int i = 0; i < n; ++i)
+      if (fetch(border_texel(i)) == cand) ++cnt;
+    if (2 * cnt <= n) {
+      int best = 0;
+      for (int i = 0; i < n; ++i) {
+        ivec4 v = fetch(border_texel(i));
+        int k = 0;
+        for (int j = 0; j < n; ++j)
+          if (fetch(border_texel(j)) == v) ++k;
+        if (k > best) { best = k; cand = v; }
+      }
+    }
+    o = vec4(cand) / 255.0;
+    return;
+  }
+  ivec4 v = fetch(p);
+  if (uBorder != 0 &&
+      (p.x == 0 || p.y == 0 || p.x == uSrcSize.x - 1 || p.y == uSrcSize.y - 1))
+    v = ivec4(texelFetch(uBg, ivec2(0), 0) * 255.0 + 0.5);
+  if (uIntensity != 0) {
+    float yv = 16.0 + 0.257 * float(v.r) + 0.504 * float(v.g) + 0.098 * float(v.b);
+    int l = int(min(yv, 255.0));
+    v = ivec4(l, l, l, uKeepAlpha != 0 ? (uEfbAlpha != 0 ? v.a : 255) : l);
+  }
+  if (uFourBit != 0) v = (v >> 4) * 17;
+  o = vec4(v) / 255.0;
+})";
+    prog = CompileShader(vs, fs);
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+      std::printf("[EFBCONV] shader failed to link, using the CPU path\n");
+      glDeleteProgram(prog);
+      prog = 0;
+      failed = true;
+      return false;
+    }
+    uMode = glGetUniformLocation(prog, "uMode");
+    uSrc = glGetUniformLocation(prog, "uSrc");
+    uBg = glGetUniformLocation(prog, "uBg");
+    uBlock = glGetUniformLocation(prog, "uBlock");
+    uSrcSize = glGetUniformLocation(prog, "uSrcSize");
+    uBorder = glGetUniformLocation(prog, "uBorder");
+    uFourBit = glGetUniformLocation(prog, "uFourBit");
+    uIntensity = glGetUniformLocation(prog, "uIntensity");
+    uKeepAlpha = glGetUniformLocation(prog, "uKeepAlpha");
+    uEfbAlpha = glGetUniformLocation(prog, "uEfbAlpha");
+    glGenVertexArrays(1, &vao);
+    glGenFramebuffers(1, &fbo);
+    GLuint t[3];
+    glGenTextures(3, t);
+    src = t[0], mid = t[1], bg = t[2];
+  }
+
+  // Saved state (the renderer re-applies most of it per batch anyway).
+  GLint old_prog, old_vao, old_read, old_draw, old_active, old_tex0, old_tex1, vp[4];
+  GLboolean cmask[4];
+  glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex0); // the copy's texture
+  const GLuint dst = (GLuint)old_tex0;
+  glGetIntegerv(GL_VIEWPORT, vp);
+  glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+  const GLenum caps[] = {GL_BLEND, GL_DEPTH_TEST, GL_CULL_FACE, GL_SCISSOR_TEST, GL_STENCIL_TEST};
+  GLboolean was_on[5];
+  for (int i = 0; i < 5; ++i) {
+    was_on[i] = glIsEnabled(caps[i]);
+    glDisable(caps[i]);
+  }
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glActiveTexture(GL_TEXTURE1);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex1);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex0);
+
+  auto alloc = [](GLuint tex, GLsizei tw, GLsizei th) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    GLint cw = 0, ch = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &cw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &ch);
+    if (cw != tw || ch != th) {
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+  };
+  auto pass = [&](int mode, GLuint in, GLsizei in_w, GLsizei in_h, GLuint out, GLsizei out_w,
+                  GLsizei out_h) {
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, out, 0);
+    glViewport(0, 0, out_w, out_h);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, in);
+    glUniform1i(uMode, mode);
+    glUniform2i(uSrcSize, in_w, in_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  };
+
+  // The raw copy -> src (the destination texture is resized below).
+  alloc(src, w, h);
+  glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+
+  glUseProgram(prog);
+  glBindVertexArray(vao);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+  glUniform1i(uSrc, 0);
+  glUniform1i(uBg, 1);
+  glUniform1i(uFourBit, four_bit);
+  glUniform1i(uIntensity, to_intensity);
+  glUniform1i(uKeepAlpha, keep_alpha);
+  glUniform1i(uEfbAlpha, efb_alpha);
+
+  GLuint cur = src;
+  uint32_t ow = w, oh = h;
+  if (half) {
+    // One output texel per 2x2 native pixels = (2*sx) x (2*sy) host pixels.
+    const uint32_t bx = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sx));
+    const uint32_t by = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sy));
+    ow = std::max(1u, w / bx);
+    oh = std::max(1u, h / by);
+    alloc(mid, ow, oh);
+    glUniform2i(uBlock, bx, by);
+    pass(0, src, w, h, mid, ow, oh);
+    cur = mid;
+  }
+  static const bool fix_border = [] {
+    const char *e = std::getenv("NWII_SHADOW_BORDER");
+    return !(e && e[0] == '0');
+  }();
+  const bool border = four_bit && fix_border && ow >= 4 && oh >= 4;
+  glUniform1i(uBorder, border);
+  if (border) {
+    alloc(bg, 1, 1);
+    pass(1, cur, ow, oh, bg, 1, 1);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, bg);
+    glActiveTexture(GL_TEXTURE0);
+  }
+  glBindTexture(GL_TEXTURE_2D, dst);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  pass(2, cur, ow, oh, dst, ow, oh);
+  glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+
+  glUseProgram(old_prog);
+  glBindVertexArray(old_vao);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, old_read);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw);
+  glViewport(vp[0], vp[1], vp[2], vp[3]);
+  glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
+  for (int i = 0; i < 5; ++i)
+    if (was_on[i]) glEnable(caps[i]);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, old_tex1);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, old_tex0);
+  glActiveTexture(old_active);
+  glBindTexture(GL_TEXTURE_2D, dst); // the caller continues on the copy's texture
+  return true;
+}
+
 // EFB copy to texture (BP 0x52): reshape the raw RGBA copy bound to
 // GL_TEXTURE_2D into what the target format reads back as when the game
 // samples it. The raw format sits in bits 3-6 (real = raw/2 + (raw&1)*8),
 // bit 15 selects YUV intensity. Channel selections are a texture swizzle;
-// the intensity variants need luma and are converted on the CPU. Without
+// the intensity variants need luma and are converted (EfbConvertGpu). Without
 // EFB alpha (RGB8 pixel formats) alpha reads as 1. Spyro's ground shadow is
 // an R4 copy used as dst*(1-a); copied raw, its stale alpha blacked out the
 // whole floor.
@@ -1518,94 +1756,132 @@ static void ApplyEfbCopyFormat(uint32_t val, uint32_t x, uint32_t y,
   //      8 R8, 9 G8, 10 B8, 11 RG8, 12 GB8.
   //
   // Half-scale copies (bit 9: 2x2 box filter) and 4-bit formats are rebuilt
-  // on the CPU at the console's resolution and precision. Spyro's projected
-  // shadow is an R4 half-scale copy: kept at full (upscaled) resolution and
-  // 8 bits, the 1-2 pixel tail survived and was cast as a long thin streak
-  // while he charged; on hardware it averages away.
+  // at the console's resolution and precision (EfbConvertGpu; CPU fallback).
+  // Spyro's projected shadow is an R4 half-scale copy: kept at full
+  // (upscaled) resolution and 8 bits, the 1-2 pixel tail survived and was
+  // cast as a long thin streak while he charged; on hardware it averages away.
   const bool half = (val >> 9) & 1;
   const bool four_bit = fmt == 0 || fmt == 2;
   const bool to_intensity = intensity && (fmt <= 3 || fmt == 8);
   if (half || four_bit || to_intensity) {
-    std::vector<unsigned char> px((size_t)w * h * 4);
-    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    uint32_t ow = w, oh = h;
-    if (half) {
-      // One output texel per 2x2 native pixels = (2*sx) x (2*sy) host pixels.
-      const uint32_t bx = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sx));
-      const uint32_t by = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sy));
-      ow = std::max(1u, w / bx);
-      oh = std::max(1u, h / by);
-      std::vector<unsigned char> small((size_t)ow * oh * 4);
-      for (uint32_t oy = 0; oy < oh; ++oy)
-        for (uint32_t ox = 0; ox < ow; ++ox) {
-          uint32_t sum[4] = {0, 0, 0, 0}, n = 0;
-          for (uint32_t yy = oy * by; yy < std::min(h, oy * by + by); ++yy)
-            for (uint32_t xx = ox * bx; xx < std::min(w, ox * bx + bx); ++xx, ++n)
-              for (int c = 0; c < 4; ++c) sum[c] += px[((size_t)yy * w + xx) * 4 + c];
-          for (int c = 0; c < 4; ++c)
-            small[((size_t)oy * ow + ox) * 4 + c] = (unsigned char)(n ? sum[c] / n : 0);
+    // NWII_EFBCONV_CHECK=1: convert each copy both ways, upload the CPU
+    // result and report texels where the GPU result differs.
+    static const bool check = std::getenv("NWII_EFBCONV_CHECK") != nullptr;
+    std::vector<unsigned char> px, gpu;
+    if (check) {
+      px.resize((size_t)w * h * 4);
+      glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    }
+    bool done = EfbConvertGpu(w, h, half, four_bit, to_intensity, fmt == 2 || fmt == 3, efb_alpha);
+    GLint gw = 0, gh = 0;
+    if (done && check) {
+      glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &gw);
+      glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &gh);
+      gpu.resize((size_t)gw * gh * 4);
+      glPixelStorei(GL_PACK_ALIGNMENT, 1);
+      glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, gpu.data());
+      glPixelStorei(GL_PACK_ALIGNMENT, 4);
+      done = false;
+    }
+    if (!done) {
+      if (!check) {
+        px.resize((size_t)w * h * 4);
+        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+      }
+      uint32_t ow = w, oh = h;
+      if (half) {
+        // One output texel per 2x2 native pixels = (2*sx) x (2*sy) host pixels.
+        const uint32_t bx = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sx));
+        const uint32_t by = std::max(1, (int)std::lround(2.0f * nwii::runtime::efb::sy));
+        ow = std::max(1u, w / bx);
+        oh = std::max(1u, h / by);
+        std::vector<unsigned char> small((size_t)ow * oh * 4);
+        for (uint32_t oy = 0; oy < oh; ++oy)
+          for (uint32_t ox = 0; ox < ow; ++ox) {
+            uint32_t sum[4] = {0, 0, 0, 0}, n = 0;
+            for (uint32_t yy = oy * by; yy < std::min(h, oy * by + by); ++yy)
+              for (uint32_t xx = ox * bx; xx < std::min(w, ox * bx + bx); ++xx, ++n)
+                for (int c = 0; c < 4; ++c) sum[c] += px[((size_t)yy * w + xx) * 4 + c];
+            for (int c = 0; c < 4; ++c)
+              small[((size_t)oy * ow + ox) * 4 + c] = (unsigned char)(n ? sum[c] / n : 0);
+          }
+        px.swap(small);
+      }
+      // Projected-shadow copies (4-bit, sampled with clamp): any non-background
+      // texel on the border is repeated to infinity along the projection --
+      // the long thin lines from Spyro's shadow to the horizon, when his
+      // stretched silhouette (charging, wings) touches the 128x128 shadow
+      // viewport's edge. Reset the 1-texel border to the background (its most
+      // common value). NWII_SHADOW_BORDER=0 keeps the border.
+      static const bool fix_border = [] {
+        const char *e = std::getenv("NWII_SHADOW_BORDER");
+        return !(e && e[0] == '0');
+      }();
+      if (four_bit && fix_border && ow >= 4 && oh >= 4) {
+        std::unordered_map<uint32_t, uint32_t> votes;
+        auto texel = [&](uint32_t x2, uint32_t y2) -> uint32_t & {
+          return *reinterpret_cast<uint32_t *>(&px[((size_t)y2 * ow + x2) * 4]);
+        };
+        for (uint32_t x2 = 0; x2 < ow; ++x2) { ++votes[texel(x2, 0)]; ++votes[texel(x2, oh - 1)]; }
+        for (uint32_t y2 = 1; y2 + 1 < oh; ++y2) { ++votes[texel(0, y2)]; ++votes[texel(ow - 1, y2)]; }
+        uint32_t bg = 0, best = 0;
+        for (const auto &[v, c] : votes)
+          if (c > best) { best = c; bg = v; }
+        uint32_t fixed = 0;
+        auto set = [&](uint32_t x2, uint32_t y2) {
+          uint32_t &t = texel(x2, y2);
+          if (t != bg) { t = bg; ++fixed; }
+        };
+        for (uint32_t x2 = 0; x2 < ow; ++x2) { set(x2, 0); set(x2, oh - 1); }
+        for (uint32_t y2 = 1; y2 + 1 < oh; ++y2) { set(0, y2); set(ow - 1, y2); }
+        static const bool stat = std::getenv("NWII_SHADOWSTAT") != nullptr;
+        if (stat) {
+          // Bounding box of non-background texels, every 30th copy or when the
+          // border had to be reset.
+          static uint32_t n = 0;
+          uint32_t x0 = ow, y0 = oh, x1 = 0, y1 = 0;
+          for (uint32_t y2 = 0; y2 < oh; ++y2)
+            for (uint32_t x2 = 0; x2 < ow; ++x2)
+              if (texel(x2, y2) != bg) {
+                x0 = std::min(x0, x2); y0 = std::min(y0, y2);
+                x1 = std::max(x1, x2); y1 = std::max(y1, y2);
+              }
+          if (fixed || (++n % 30) == 0)
+            std::printf("[SHADOW] %ux%u copy fmt=%u bg=%08X bbox=%u,%u-%u,%u reset=%u\n", ow, oh,
+                        fmt, bg, x0, y0, x1, y1, fixed);
         }
-      px.swap(small);
-    }
-    // Projected-shadow copies (4-bit, sampled with clamp): any non-background
-    // texel on the border is repeated to infinity along the projection --
-    // the long thin lines from Spyro's shadow to the horizon, when his
-    // stretched silhouette (charging, wings) touches the 128x128 shadow
-    // viewport's edge. Reset the 1-texel border to the background (its most
-    // common value). NWII_SHADOW_BORDER=0 keeps the border.
-    static const bool fix_border = [] {
-      const char *e = std::getenv("NWII_SHADOW_BORDER");
-      return !(e && e[0] == '0');
-    }();
-    if (four_bit && fix_border && ow >= 4 && oh >= 4) {
-      std::unordered_map<uint32_t, uint32_t> votes;
-      auto texel = [&](uint32_t x2, uint32_t y2) -> uint32_t & {
-        return *reinterpret_cast<uint32_t *>(&px[((size_t)y2 * ow + x2) * 4]);
-      };
-      for (uint32_t x2 = 0; x2 < ow; ++x2) { ++votes[texel(x2, 0)]; ++votes[texel(x2, oh - 1)]; }
-      for (uint32_t y2 = 1; y2 + 1 < oh; ++y2) { ++votes[texel(0, y2)]; ++votes[texel(ow - 1, y2)]; }
-      uint32_t bg = 0, best = 0;
-      for (const auto &[v, c] : votes)
-        if (c > best) { best = c; bg = v; }
-      uint32_t fixed = 0;
-      auto set = [&](uint32_t x2, uint32_t y2) {
-        uint32_t &t = texel(x2, y2);
-        if (t != bg) { t = bg; ++fixed; }
-      };
-      for (uint32_t x2 = 0; x2 < ow; ++x2) { set(x2, 0); set(x2, oh - 1); }
-      for (uint32_t y2 = 1; y2 + 1 < oh; ++y2) { set(0, y2); set(ow - 1, y2); }
-      static const bool stat = std::getenv("NWII_SHADOWSTAT") != nullptr;
-      if (stat) {
-        // Bounding box of non-background texels, every 30th copy or when the
-        // border had to be reset.
-        static uint32_t n = 0;
-        uint32_t x0 = ow, y0 = oh, x1 = 0, y1 = 0;
-        for (uint32_t y2 = 0; y2 < oh; ++y2)
-          for (uint32_t x2 = 0; x2 < ow; ++x2)
-            if (texel(x2, y2) != bg) {
-              x0 = std::min(x0, x2); y0 = std::min(y0, y2);
-              x1 = std::max(x1, x2); y1 = std::max(y1, y2);
-            }
-        if (fixed || (++n % 30) == 0)
-          std::printf("[SHADOW] %ux%u copy fmt=%u bg=%08X bbox=%u,%u-%u,%u reset=%u\n", ow, oh,
-                      fmt, bg, x0, y0, x1, y1, fixed);
       }
-    }
-    const bool keep_alpha = (fmt == 2 || fmt == 3);
-    for (size_t i = 0; i < px.size(); i += 4) {
-      if (to_intensity) {
-        const float yv = 16.f + 0.257f * px[i] + 0.504f * px[i + 1] +
-                         0.098f * px[i + 2];
-        const unsigned char l = (unsigned char)(yv > 255.f ? 255.f : yv);
-        const unsigned char a = keep_alpha ? (efb_alpha ? px[i + 3] : 255) : l;
-        px[i] = px[i + 1] = px[i + 2] = l;
-        px[i + 3] = a;
+      const bool keep_alpha = (fmt == 2 || fmt == 3);
+      for (size_t i = 0; i < px.size(); i += 4) {
+        if (to_intensity) {
+          const float yv = 16.f + 0.257f * px[i] + 0.504f * px[i + 1] +
+                           0.098f * px[i + 2];
+          const unsigned char l = (unsigned char)(yv > 255.f ? 255.f : yv);
+          const unsigned char a = keep_alpha ? (efb_alpha ? px[i + 3] : 255) : l;
+          px[i] = px[i + 1] = px[i + 2] = l;
+          px[i + 3] = a;
+        }
+        if (four_bit)
+          for (int c = 0; c < 4; ++c) px[i + c] = (unsigned char)((px[i + c] >> 4) * 17);
       }
-      if (four_bit)
-        for (int c = 0; c < 4; ++c) px[i + c] = (unsigned char)((px[i + c] >> 4) * 17);
+      if (check && !gpu.empty()) {
+        static uint32_t copies = 0, bad_copies = 0;
+        size_t diff = 0;
+        if ((uint32_t)gw != ow || (uint32_t)gh != oh)
+          diff = px.size() / 4;
+        else
+          for (size_t i = 0; i < px.size(); i += 4)
+            if (std::memcmp(&px[i], &gpu[i], 4) != 0) ++diff;
+        ++copies;
+        if (diff) ++bad_copies;
+        if (diff || copies % 300 == 0)
+          std::printf("[EFBCONV] %ux%u -> %ux%u (gpu %dx%d) fmt=%u half=%d int=%d: %zu texels "
+                      "differ; %u of %u copies differed\n",
+                      w, h, ow, oh, gw, gh, fmt, half, to_intensity, diff, bad_copies, copies);
+      }
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ow, oh, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                   px.data());
     }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ow, oh, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 px.data());
     if (to_intensity) {
       const GLint identity[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
       glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, identity);
@@ -1820,7 +2096,8 @@ public:
             ApplyEfbCopyFormat(cmd.val, 0, 0, r.w, r.h);
             glBindFramebuffer(GL_FRAMEBUFFER, efb::draw_fbo);
             glBindTexture(GL_TEXTURE_2D, tex);
-            glGenerateMipmap(GL_TEXTURE_2D);
+            // Mips only when a draw samples it mipmapped (ApplySamplerMode).
+            s_efb_mips_stale.insert(tex);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             // Guest bytes the copy would occupy (at least 4 bpp; half-scale

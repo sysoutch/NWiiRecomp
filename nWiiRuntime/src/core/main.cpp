@@ -1051,21 +1051,27 @@ int main(int argc, char **argv) {
           extern uint64_t g_stat_frames, g_stat_draws;
           extern uint64_t g_stat_parse_us, g_stat_render_us;
           extern uint64_t nwii_stat_hash0(), nwii_stat_shaders();
-          namespace efb = nwii::runtime::efb;
-          efb::resolve();
-          std::vector<unsigned char> p((size_t)efb::width * efb::height * 4);
-          glBindFramebuffer(GL_READ_FRAMEBUFFER, efb::read_fbo());
-          glReadPixels(0, 0, efb::width, efb::height, GL_RGBA, GL_UNSIGNED_BYTE, p.data());
-          glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+          // efb_nonblack reads the whole EFB back (a full GPU sync plus ~15 MB
+          // at 3x widescreen): a visible hitch every 5 s on slower GPUs, so it
+          // is only measured with NWII_VERBOSE=1.
           size_t nonblack = 0;
-          for (size_t i = 0; i < p.size(); i += 4)
-            if (p[i] | p[i + 1] | p[i + 2])
-              ++nonblack;
+          if (nwii::runtime::g_verbose) {
+            namespace efb = nwii::runtime::efb;
+            efb::resolve();
+            std::vector<unsigned char> p((size_t)efb::width * efb::height * 4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, efb::read_fbo());
+            glReadPixels(0, 0, efb::width, efb::height, GL_RGBA, GL_UNSIGNED_BYTE, p.data());
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            for (size_t i = 0; i < p.size(); i += 4)
+              if (p[i] | p[i + 1] | p[i + 2])
+                ++nonblack;
+            nonblack = nonblack * 307200 / (p.size() / 4);
+          }
           std::cout << "[STAT] " << ++stat_n * 5 << "s frames=" << std::dec
                     << g_stat_frames << " draws=" << g_stat_draws
                     << " parse_ms=" << g_stat_parse_us / 1000
                     << " render_ms=" << g_stat_render_us / 1000
-                    << " efb_nonblack=" << nonblack * 307200 / (p.size() / 4) << "/307200"
+                    << " efb_nonblack=" << nonblack << "/307200"
                     << " shaders=" << nwii_stat_shaders() << " hash0=0x"
                     << std::hex << nwii_stat_hash0();
           g_stat_parse_us = 0;
