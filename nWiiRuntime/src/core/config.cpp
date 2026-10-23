@@ -74,6 +74,12 @@ void Config::load(const std::string& filepath) {
             volume = std::clamp(*v, 0, 100);
         if (auto v = tbl["audio"]["mute"].value<bool>())
             mute = *v;
+        if (auto v = tbl["mouse"]["camera"].value<bool>())
+            mouse_camera = *v;
+        if (auto v = tbl["mouse"]["sensitivity"].value<int>())
+            mouse_sensitivity = std::clamp(*v, 1, 100);
+        if (auto v = tbl["mouse"]["invert_y"].value<bool>())
+            mouse_invert_y = *v;
         if (auto v = tbl["launcher"]["enabled"].value<bool>())
             launcher = *v;
         if (auto *arr = tbl["launcher"]["recent"].as_array())

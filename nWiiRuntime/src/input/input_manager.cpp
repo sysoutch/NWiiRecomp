@@ -1,4 +1,5 @@
 #include "input/input_manager.h"
+#include "sources/mouse_keyboard_source.h"
 #include <iostream>
 #include <algorithm>
 #include <chrono>
@@ -57,6 +58,7 @@ void InputManager::update() {
         source->update(gc_pads, wii_motes);
     }
     apply_input_script();
+    apply_mouse_camera(gc_pads[0]);
     if (suppressed) {
         for (int i = 0; i < 4; ++i) {
             const int err = gc_pads[i].err;

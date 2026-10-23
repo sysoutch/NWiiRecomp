@@ -472,10 +472,29 @@ void controller_bindings() {
     }
 }
 
+void mouse_settings() {
+    Config &cfg = Config::get();
+    ImGui::TextWrapped("Turn the camera left/right with the mouse (it drives the C-stick); while Y is "
+                       "held (look mode) it aims up/down too. Click into the game to capture the "
+                       "mouse; Esc or F1 releases it.");
+    ImGui::Spacing();
+    row_label("Mouse camera");
+    if (ImGui::Checkbox("##mousecam", &cfg.mouse_camera)) changed();
+    row_label("Sensitivity");
+    ImGui::SliderInt("##mousesens", &cfg.mouse_sensitivity, 1, 100);
+    if (ImGui::IsItemDeactivatedAfterEdit()) changed();
+    row_label("Invert up/down");
+    if (ImGui::Checkbox("##mouseinv", &cfg.mouse_invert_y)) changed();
+}
+
 void controls_tab() {
     if (ImGui::BeginTabBar("##controls")) {
         if (ImGui::BeginTabItem("Keyboard")) {
             keyboard_bindings();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Mouse")) {
+            mouse_settings();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Controller")) {
@@ -773,6 +792,9 @@ bool save_settings() {
     set_value(lines, "graphics", "frame_rate", std::to_string(cfg.frame_rate));
     set_value(lines, "audio", "volume", std::to_string(cfg.volume));
     set_value(lines, "audio", "mute", b2s(cfg.mute));
+    set_value(lines, "mouse", "camera", b2s(cfg.mouse_camera));
+    set_value(lines, "mouse", "sensitivity", std::to_string(cfg.mouse_sensitivity));
+    set_value(lines, "mouse", "invert_y", b2s(cfg.mouse_invert_y));
     set_value(lines, "launcher", "enabled", b2s(cfg.launcher));
     {
         std::string arr = "[";

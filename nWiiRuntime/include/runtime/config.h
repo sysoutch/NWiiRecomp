@@ -69,6 +69,9 @@ public:
     int frame_rate = 60;     // VI retrace rate = max game fps (60, 90 or 120)
     int volume = 100;        // [audio] master volume, percent
     bool mute = false;
+    bool mouse_camera = true;   // [mouse] camera: mouse movement drives the C-stick
+    int mouse_sensitivity = 50; // [mouse] sensitivity, 1-100
+    bool mouse_invert_y = false; // [mouse] invert_y (look mode, Y held)
     bool launcher = true;    // [launcher] enabled: title menu before the game boots
     std::vector<std::string> recent_discs; // [launcher] recent, newest first
     std::string config_path; // the TOML loaded; the settings overlay saves here

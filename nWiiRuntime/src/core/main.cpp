@@ -959,7 +959,12 @@ int main(int argc, char **argv) {
         while (SDL_PollEvent(&e)) {
           if (e.type == SDL_QUIT) quit = true;
           nwii::runtime::ui::handle_event(e); // F1 settings overlay
+          nwii::runtime::input::mouse_camera_event(e, nwii::runtime::ui::is_open());
         }
+        // The overlay (or turning the option off) gives the cursor back.
+        if (SDL_GetRelativeMouseMode() &&
+            (nwii::runtime::ui::is_open() || !nwii::runtime::Config::get().mouse_camera))
+          SDL_SetRelativeMouseMode(SDL_FALSE);
       }
 
       // The game sees a neutral pad while the settings overlay is open.
@@ -1274,7 +1279,13 @@ int main(int argc, char **argv) {
                 char cmd[16] = {}, name[16] = {};
                 int ms = 200;
                 const int n = std::sscanf(line, "%15s %15s %d", cmd, name, &ms);
-                if (n >= 2 && std::strcmp(cmd, "press") == 0)
+                if (n >= 1 && std::strcmp(cmd, "mouse") == 0) {
+                  // "mouse <dx> <ms> [dy]": synthetic mouse-camera motion.
+                  int dx = 0, mms = 500, dy = 0;
+                  std::sscanf(line, "%*s %d %d %d", &dx, &mms, &dy);
+                  nwii::runtime::input::inject_mouse_motion(dx, dy, mms);
+                }
+                else if (n >= 2 && std::strcmp(cmd, "press") == 0)
                   nwii::runtime::input::inject_press(name, ms);
                 else if (n >= 2 && std::strcmp(cmd, "interp") == 0) {
                   // "interp on [hexlimit]": interpret functions below limit.
