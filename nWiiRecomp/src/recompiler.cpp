@@ -323,6 +323,8 @@ std::vector<std::string> Recompiler::generate_cpp(uint32_t entry_point) {
       hout << "void " << name << "(nwii::runtime::CPUContext& ctx);\n";
     for (const auto &[addr, name] : config_.hle_post_hooks)
       hout << "void " << name << "(nwii::runtime::CPUContext& ctx, const unsigned int* args);\n";
+    for (const auto &[addr, name] : config_.hle_pre_hooks)
+      hout << "void " << name << "(nwii::runtime::CPUContext& ctx, const unsigned int* args);\n";
     hout << "}\n";
 
     std::set<std::string> emitted_names;
@@ -715,16 +717,21 @@ std::string Recompiler::generate_function_cpp(const analyzer::Function &func) {
 void Recompiler::emit_function(std::ostream &out,
                                const analyzer::Function &func,
                                const std::string &func_name) {
-  // [hle_post_hooks]: the recompiled body goes into <name>_body, and <name>
-  // calls it and then the native with the entry arguments.
+  // [hle_post_hooks] / [hle_pre_hooks]: the recompiled body goes into
+  // <name>_body, and <name> calls the pre native, the body and then the post
+  // native, each with the entry arguments.
   auto post = config_.hle_post_hooks.find(func.start_address);
-  if (post != config_.hle_post_hooks.end()) {
+  auto pre = config_.hle_pre_hooks.find(func.start_address);
+  const bool has_post = post != config_.hle_post_hooks.end();
+  const bool has_pre = pre != config_.hle_pre_hooks.end();
+  if (has_post || has_pre) {
     out << "static void " << func_name << "_body(CPUContext& NWII_RESTRICT ctx);\n";
     out << "void " << func_name << "(CPUContext& NWII_RESTRICT ctx) {\n";
     out << "    unsigned int args[8];\n";
     out << "    for (int i = 0; i < 8; ++i) args[i] = ctx.gpr[3 + i];\n";
+    if (has_pre) out << "    " << pre->second << "(ctx, args);\n";
     out << "    " << func_name << "_body(ctx);\n";
-    out << "    " << post->second << "(ctx, args);\n";
+    if (has_post) out << "    " << post->second << "(ctx, args);\n";
     out << "}\n\n";
     out << "static void " << func_name << "_body(CPUContext& NWII_RESTRICT ctx) {\n";
   } else {

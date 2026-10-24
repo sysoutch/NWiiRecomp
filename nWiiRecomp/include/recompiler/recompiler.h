@@ -41,6 +41,9 @@ struct RecompilerConfig {
     // native is called as name(ctx, args) with args = r3..r10 at entry
     // (to adjust what the function produced).
     std::map<uint32_t, std::string> hle_post_hooks;
+    // [hle_pre_hooks]: name(ctx, args) runs first, then the function as
+    // recompiled (to adjust its inputs).
+    std::map<uint32_t, std::string> hle_pre_hooks;
 
     
 
