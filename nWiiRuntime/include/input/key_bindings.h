@@ -30,8 +30,17 @@ constexpr int kNumPadControls = (int)PadControl::Count;
 inline KeyBinding &binding(PadControl c) { return key_bindings()[(int)c]; }
 
 void reset_key_bindings();
-// Bind from a scancode name; false (and unchanged) for an unknown name.
+// Bind from a scancode name or a mouse button name; false (and unchanged)
+// for an unknown name.
 bool set_key_binding(const std::string &id, const std::string &key_name);
+
+// Mouse buttons bind like keys: kMouseButtonBase + the SDL button number
+// (1 left, 2 middle, 3 right, 4/5 side), above every scancode.
+constexpr int kMouseButtonBase = 1000;
+inline bool is_mouse_binding(int code) { return code > kMouseButtonBase && code <= kMouseButtonBase + 5; }
+// "Space", "Mouse Left", ... / "(unbound)"; and back (0 = unknown).
+std::string key_binding_name(int code);
+int key_binding_from_name(const std::string &name);
 
 // Controller -> GameCube pad buttons (A ... D-pad right, PadControl order),
 // from the [controller] section (e.g. z = "righttrigger"), edited live in the

@@ -117,6 +117,7 @@ void MouseKeyboardSource::update(GameCubePadState pads[4], WiimoteState motes[4]
     pads[0].err = 0;
     auto down = [&](PadControl c) {
         const int sc = binding(c).scancode;
+        if (is_mouse_binding(sc)) return (mouse_state & SDL_BUTTON(sc - kMouseButtonBase)) != 0;
         return sc > 0 && sc < SDL_NUM_SCANCODES && keys[sc];
     };
     if (down(PadControl::A)) pads[0].buttons |= 0x0100;

@@ -37,10 +37,28 @@ void reset_key_bindings() {
         t[i].scancode = t[i].default_scancode;
 }
 
-bool set_key_binding(const std::string &id, const std::string &key_name) {
+namespace {
+const char *const kMouseNames[5] = {"Mouse Left", "Mouse Middle", "Mouse Right", "Mouse 4",
+                                    "Mouse 5"};
+} // namespace
+
+std::string key_binding_name(int code) {
+    if (is_mouse_binding(code)) return kMouseNames[code - kMouseButtonBase - 1];
+    if (code <= 0) return "(unbound)";
+    const char *n = SDL_GetScancodeName((SDL_Scancode)code);
+    return (n && *n) ? n : "(unknown)";
+}
+
+int key_binding_from_name(const std::string &name) {
+    for (int b = 0; b < 5; ++b)
+        if (name == kMouseNames[b]) return kMouseButtonBase + 1 + b;
     // SDL_GetScancodeFromName is a table lookup; it works before SDL_Init.
-    const SDL_Scancode sc = SDL_GetScancodeFromName(key_name.c_str());
-    if (sc == SDL_SCANCODE_UNKNOWN) return false;
+    return SDL_GetScancodeFromName(name.c_str());
+}
+
+bool set_key_binding(const std::string &id, const std::string &key_name) {
+    const int sc = key_binding_from_name(key_name);
+    if (sc == 0) return false;
     KeyBinding *t = key_bindings();
     for (int i = 0; i < kNumPadControls; ++i)
         if (id == t[i].id) {

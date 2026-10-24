@@ -51,6 +51,10 @@ public:
     }
 
     void load(const std::string& filepath);
+    // The game's own keyboard defaults: the [keyboard] section of
+    // <config name>.default.toml next to the loaded config, if any (after
+    // the runtime's generic defaults, e.g. on "Reset to defaults").
+    void apply_default_keyboard() const;
 
     
     void load_game_profile();

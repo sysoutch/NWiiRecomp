@@ -231,5 +231,22 @@ void Config::load_game_profile() {
     }
 }
 
+
+void Config::apply_default_keyboard() const {
+    namespace fs = std::filesystem;
+    if (config_path.empty()) return;
+    const fs::path p(config_path);
+    const fs::path def = p.parent_path() / (p.stem().string() + ".default.toml");
+    std::error_code ec;
+    if (!fs::exists(def, ec)) return;
+    try {
+        const toml::table tbl = toml::parse_file(def.string());
+        if (auto *kb = tbl["keyboard"].as_table())
+            for (auto &&[k, v] : *kb)
+                if (auto name = v.value<std::string>())
+                    input::set_key_binding(std::string(k.str()), *name);
+    } catch (const std::exception &) {}
+}
+
 } 
 } 

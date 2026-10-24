@@ -124,11 +124,7 @@ void changed() {
     if (!save_settings()) note("Could not save settings");
 }
 
-const char *key_name(int sc) {
-    if (sc <= 0) return "(unbound)";
-    const char *n = SDL_GetScancodeName((SDL_Scancode)sc);
-    return (n && *n) ? n : "(unknown)";
-}
+std::string key_name(int sc) { return input::key_binding_name(sc); }
 
 void set_open(bool open) {
     s_open = open;
@@ -355,8 +351,8 @@ void audio_tab() {
 
 void keyboard_bindings() {
     using namespace nwii::runtime::input;
-    ImGui::TextWrapped("Keyboard controls for the GameCube pad. Click a key, then "
-                       "press the new one (Esc cancels).");
+    ImGui::TextWrapped("Keyboard and mouse controls for the GameCube pad. Click a control, then "
+                       "press the new key or mouse button (Esc cancels).");
     ImGui::Spacing();
     KeyBinding *t = key_bindings();
     const float h = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.4f;
@@ -374,7 +370,7 @@ void keyboard_bindings() {
             ImGui::TableSetColumnIndex(1);
             ImGui::PushID(i);
             const bool cap = s_capturing == i;
-            std::string text = cap ? std::string("Press a key...") : key_name(t[i].scancode);
+            std::string text = cap ? std::string("Press a key or mouse button...") : key_name(t[i].scancode);
             if (cap) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.55f, 0.10f, 1.0f));
             if (ImGui::Button(text.c_str(), ImVec2(-FLT_MIN, 0)))
                 s_capturing = cap ? -1 : i;
@@ -385,6 +381,7 @@ void keyboard_bindings() {
     }
     if (ImGui::Button("Reset to defaults")) {
         reset_key_bindings();
+        Config::get().apply_default_keyboard(); // the game's own defaults on top
         s_capturing = -1;
         changed();
         note("Keyboard controls reset to defaults");
@@ -641,9 +638,14 @@ bool handle_event(const SDL_Event &e) {
         s_pad_capturing = -1; // cancel controller capture
         return true;
     }
-    if (s_open && s_capturing >= 0 && e.type == SDL_KEYDOWN && !e.key.repeat) {
-        const int sc = e.key.keysym.scancode;
-        if (sc != SDL_SCANCODE_ESCAPE && sc != SDL_SCANCODE_F1) {
+    // A mouse button binds the same way (the click that started the capture
+    // has already been released: ImGui buttons fire on release).
+    if (s_open && s_capturing >= 0 &&
+        ((e.type == SDL_KEYDOWN && !e.key.repeat) || e.type == SDL_MOUSEBUTTONDOWN)) {
+        const int sc = e.type == SDL_MOUSEBUTTONDOWN ? input::kMouseButtonBase + e.button.button
+                                                     : (int)e.key.keysym.scancode;
+        if (sc != SDL_SCANCODE_ESCAPE && sc != SDL_SCANCODE_F1 &&
+            (e.type != SDL_MOUSEBUTTONDOWN || input::is_mouse_binding(sc))) {
             input::KeyBinding *t = input::key_bindings();
             for (int i = 0; i < input::kNumPadControls; ++i)
                 if (i != s_capturing && t[i].scancode == sc)
