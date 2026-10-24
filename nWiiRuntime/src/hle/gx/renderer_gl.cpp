@@ -263,6 +263,110 @@ static size_t RingUpload(GLenum target, size_t &pos, size_t cap, const void *src
   return at;
 }
 
+// A VAO for the BatchVertex layout over these buffers (the element buffer
+// binding is recorded in the VAO).
+static void SetupBatchVao(GLuint &vao, GLuint vbo, GLuint ibo) {
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glEnableVertexAttribArray(2);
+  glEnableVertexAttribArray(3);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
+                        (void *)offsetof(BatchVertex, x));
+  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
+                        (void *)offsetof(BatchVertex, r));
+  glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
+                        (void *)offsetof(BatchVertex, tc));
+  glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
+                        (void *)offsetof(BatchVertex, nx));
+  // Texcoords 1-7 at locations 4-10 (see tev_shader_gen.cpp).
+  for (int i = 1; i < 8; ++i) {
+    glEnableVertexAttribArray(3 + i);
+    glVertexAttribPointer(3 + i, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
+                          (void *)(offsetof(BatchVertex, tc) + i * 3 * sizeof(float)));
+  }
+}
+
+// Persistent mapped rings (GL 4.4 / ARB_buffer_storage): the vertex and index
+// buffers are mapped once, coherently, and batches are written straight into
+// them -- no map/unmap pair per batch (two driver calls each, ~900 batches a
+// frame). Each ring is split into kSegs segments; leaving a segment fences it,
+// entering one waits for its fence, so nothing the GPU may still read is
+// overwritten. Batches larger than a segment, or no GL 4.4: the streaming
+// rings below. NWII_PERSISTENT_VBO=0: off.
+struct PersistentRing {
+  static constexpr int kSegs = 8;
+  GLuint buf = 0;
+  uint8_t *ptr = nullptr;
+  size_t cap = 0, pos = 0;
+  GLsync fence[kSegs] = {};
+};
+static PersistentRing s_pvbo, s_pibo;
+static GLuint s_vao_persistent = 0;
+
+static bool PersistentRingsInit() {
+  const char *e = std::getenv("NWII_PERSISTENT_VBO");
+  if (e && e[0] == '0') return false;
+  GLint major = 0, minor = 0;
+  glGetIntegerv(GL_MAJOR_VERSION, &major);
+  glGetIntegerv(GL_MINOR_VERSION, &minor);
+  bool ext = major > 4 || (major == 4 && minor >= 4);
+  if (!ext) {
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n && !ext; ++i)
+      ext = std::strcmp((const char *)glGetStringi(GL_EXTENSIONS, i), "GL_ARB_buffer_storage") == 0;
+  }
+  using PFN_BufferStorage = void(APIENTRY *)(GLenum, GLsizeiptr, const void *, GLbitfield);
+  const auto buffer_storage = ext ? (PFN_BufferStorage)SDL_GL_GetProcAddress("glBufferStorage") : nullptr;
+  if (!buffer_storage) return false;
+  constexpr GLbitfield kPersistent = 0x0040, kCoherent = 0x0080; // GL_MAP_*_BIT
+  const GLbitfield flags = GL_MAP_WRITE_BIT | kPersistent | kCoherent;
+  auto make = [&](PersistentRing &r, GLenum target, size_t cap) {
+    glGenBuffers(1, &r.buf);
+    glBindBuffer(target, r.buf);
+    buffer_storage(target, (GLsizeiptr)cap, nullptr, flags);
+    r.ptr = (uint8_t *)glMapBufferRange(target, 0, (GLsizeiptr)cap, flags);
+    r.cap = cap;
+    return r.ptr != nullptr;
+  };
+  GLuint vao_before = 0;
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING, (GLint *)&vao_before);
+  glBindVertexArray(0);
+  // 16 MB of vertices (2 MB segments), 4 MB of indices (512 KB segments).
+  const bool ok = make(s_pvbo, GL_ARRAY_BUFFER, (size_t)(1u << 16) * sizeof(BatchVertex)) &&
+                  make(s_pibo, GL_ELEMENT_ARRAY_BUFFER, (size_t)(1u << 20) * sizeof(uint32_t));
+  if (ok) SetupBatchVao(s_vao_persistent, s_pvbo.buf, s_pibo.buf);
+  glBindVertexArray(vao_before);
+  std::printf("[GL] persistent mapped vertex buffers: %s\n", ok ? "on" : "unavailable");
+  return ok;
+}
+
+// Room for `bytes` in the ring (one segment at most); SIZE_MAX if too big.
+static size_t PersistentAlloc(PersistentRing &r, size_t bytes) {
+  const size_t seg = r.cap / PersistentRing::kSegs;
+  if (bytes > seg) return SIZE_MAX;
+  const size_t cur = r.pos / seg;
+  if (r.pos + bytes > (cur + 1) * seg || r.pos >= r.cap) {
+    const size_t done = std::min(cur, (size_t)PersistentRing::kSegs - 1);
+    if (r.fence[done]) glDeleteSync(r.fence[done]);
+    r.fence[done] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    const size_t next = (done + 1) % PersistentRing::kSegs;
+    if (GLsync f = r.fence[next]) {
+      while (glClientWaitSync(f, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull) == GL_TIMEOUT_EXPIRED) {}
+      glDeleteSync(f);
+      r.fence[next] = nullptr;
+    }
+    r.pos = next * seg;
+  }
+  const size_t at = r.pos;
+  r.pos += bytes;
+  return at;
+}
+
 static void FlushBatch() {
   if (s_indices.empty()) {
     s_batch.clear();
@@ -270,31 +374,11 @@ static void FlushBatch() {
   }
 
   if (!s_vao) {
-    glGenVertexArrays(1, &s_vao);
     glGenBuffers(1, &s_vbo);
     glGenBuffers(1, &s_ibo);
-    glBindVertexArray(s_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_ibo); // recorded in the VAO
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glEnableVertexAttribArray(2);
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
-                          (void *)offsetof(BatchVertex, x));
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
-                          (void *)offsetof(BatchVertex, r));
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
-                          (void *)offsetof(BatchVertex, tc));
-    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
-                          (void *)offsetof(BatchVertex, nx));
-    // Texcoords 1-7 at locations 4-10 (see tev_shader_gen.cpp).
-    for (int i = 1; i < 8; ++i) {
-      glEnableVertexAttribArray(3 + i);
-      glVertexAttribPointer(3 + i, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex),
-                            (void *)(offsetof(BatchVertex, tc) + i * 3 * sizeof(float)));
-    }
+    SetupBatchVao(s_vao, s_vbo, s_ibo);
   }
+  static const bool persistent = PersistentRingsInit();
 
   glBindVertexArray(s_vao);
   glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
@@ -314,7 +398,18 @@ static void FlushBatch() {
   const size_t vbytes = n * sizeof(BatchVertex), ibytes = ni * sizeof(uint32_t);
   GLint first = 0;
   size_t ioff = 0;
-  if (!ring || vbytes > kVboBytes || ibytes > kIboBytes) {
+  size_t pv = SIZE_MAX, pi = SIZE_MAX;
+  if (persistent) {
+    pv = PersistentAlloc(s_pvbo, vbytes);
+    if (pv != SIZE_MAX) pi = PersistentAlloc(s_pibo, ibytes);
+  }
+  if (pi != SIZE_MAX) {
+    std::memcpy(s_pvbo.ptr + pv, s_batch.data(), vbytes);
+    std::memcpy(s_pibo.ptr + pi, s_indices.data(), ibytes);
+    glBindVertexArray(s_vao_persistent);
+    first = (GLint)(pv / sizeof(BatchVertex));
+    ioff = pi;
+  } else if (!ring || vbytes > kVboBytes || ibytes > kIboBytes) {
     glBufferData(GL_ARRAY_BUFFER, vbytes, s_batch.data(), GL_STREAM_DRAW);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibytes, s_indices.data(), GL_STREAM_DRAW);
     s_vbo_pos = kVboBytes; // no longer the rings: reallocate next time
