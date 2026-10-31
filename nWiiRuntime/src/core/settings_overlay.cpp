@@ -276,7 +276,7 @@ void graphics_tab() {
         std::vector<int> v;
         std::vector<std::string> l;
         for (int s = 1; s <= 6; ++s) {
-            const int w = cfg.widescreen ? (640 * s * 4 + 2) / 3 : 640 * s;
+            const int w = (int)std::lround(640 * s * cfg.aspect_factor());
             char buf[64];
             std::snprintf(buf, sizeof buf, "%dx  (%dx%d)%s", s, w, 480 * s,
                           s == 1 ? "  native" : "");
@@ -319,12 +319,19 @@ void graphics_tab() {
     }
 
     ImGui::Spacing();
-    row_label("Widescreen (16:9)");
-    if (ImGui::Checkbox("##ws", &cfg.widescreen)) {
-        s_req.rebuild_efb = true;
-        changed();
+    {
+        // w * 100 + h as the combo value.
+        const std::vector<int> v = {403, 1610, 1609, 2109, 3209};
+        const std::vector<std::string> l = {"4:3  (original)", "16:10", "16:9", "21:9", "32:9"};
+        int code = cfg.aspect_w * 100 + cfg.aspect_h;
+        row_label("Aspect ratio");
+        if (int_combo("##aspect", code, v, l)) {
+            cfg.set_aspect(code / 100, code % 100);
+            s_req.rebuild_efb = true;
+            changed();
+        }
+        help("Wider field of view instead of stretching; the HUD keeps its shape.");
     }
-    help("Wider field of view instead of stretching; the HUD keeps its shape.");
     row_label("Fullscreen");
     if (ImGui::Checkbox("##fs", &cfg.fullscreen)) {
         s_req.fullscreen = true;
@@ -728,7 +735,7 @@ void frame(void (*underlay)()) {
             Config &c = Config::get();
             c.internal_scale = sc;
             c.msaa = ms;
-            c.widescreen = ws != 0;
+            c.set_aspect(ws ? 16 : 4, ws ? 9 : 3);
             s_req.rebuild_efb = true;
             set_open(false);
             std::cout << "[UI] live switch to " << sc << "x, msaa " << ms << ", ws " << ws << std::endl;
@@ -788,6 +795,8 @@ bool save_settings() {
     set_value(lines, "graphics", "msaa", std::to_string(cfg.msaa));
     set_value(lines, "graphics", "anisotropy", std::to_string(cfg.anisotropy));
     set_value(lines, "graphics", "widescreen", b2s(cfg.widescreen));
+    set_value(lines, "graphics", "aspect_ratio",
+              "\"" + std::to_string(cfg.aspect_w) + ":" + std::to_string(cfg.aspect_h) + "\"");
     set_value(lines, "graphics", "fullscreen", b2s(cfg.fullscreen));
     set_value(lines, "graphics", "vsync", b2s(cfg.enable_vsync));
     set_value(lines, "graphics", "show_fps", b2s(cfg.show_fps));

@@ -10,7 +10,8 @@ namespace nwii::runtime::efb {
 
 extern int scale;            // internal resolution multiplier ([graphics] internal_scale)
 extern int samples;          // MSAA samples, 1 = off ([graphics] msaa)
-extern bool widescreen;      // EFB widened to 16:9 ([graphics] widescreen)
+extern bool widescreen;      // EFB wider than 4:3 ([graphics] aspect_ratio)
+extern float wide;           // its width relative to 4:3 (1 = 4:3, 4/3 = 16:9)
 extern int width, height;    // host size
 extern float sx, sy;         // host pixels per native EFB unit
 extern unsigned draw_fbo;    // what GX draws into (multisampled when samples > 1)

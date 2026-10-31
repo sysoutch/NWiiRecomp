@@ -473,8 +473,8 @@ namespace nwii::runtime::gx {
 
 // Widescreen state: what the current draw wants, and what the bound
 // projection uniform was built with.
-static bool s_ws_compress = false;
-static bool s_ws_applied = false;
+static float s_ws_compress = 1.0f; // x scale of the projection, 1 = none
+static float s_ws_applied = 1.0f;
 
 // GX viewport (XF 0x101A-0x101F: x/y/z scale, x/y/z origin + 342) as a
 // native-unit rect; full 640x480 when the game never set one.
@@ -525,9 +525,10 @@ static void ApplyViewport() {
 // alone so its texture comes out as the game expects). 2D draws that span
 // the whole width -- fades, full-screen overlays -- are not compressed, so
 // they still cover the widened screen.
-static bool WidescreenWanted(const GXCommand &cmd) {
+static float WidescreenWanted(const GXCommand &cmd) {
+  const float wide = nwii::runtime::efb::wide;
   if (!nwii::runtime::efb::widescreen || !g_state.projSet)
-    return false;
+    return 1.0f;
   float left, top, w, h;
   GetViewport(left, top, w, h);
   if (w < 600.0f)
@@ -546,9 +547,11 @@ static bool WidescreenWanted(const GXCommand &cmd) {
         zmin = std::min(zmin, v.pos[2]);
         zmax = std::max(zmax, v.pos[2]);
       }
-      return zmax - zmin < 0.01f && zmin > -300.0f && zmax < 0.0f;
+      if (zmax - zmin < 0.01f && zmin > -300.0f && zmax < 0.0f) return 1.0f / wide;
+      // The scene: already 16:9 wide, so only what lies beyond 16:9.
+      return (4.0f / 3.0f) / wide;
     }
-    return true;
+    return 1.0f / wide;
   }
   const float a = g_state.projection[0], b = g_state.projection[1];
   float mn = 1e9f, mx = -1e9f;
@@ -557,7 +560,7 @@ static bool WidescreenWanted(const GXCommand &cmd) {
     mn = std::min(mn, x);
     mx = std::max(mx, x);
   }
-  return !(mn <= -0.95f && mx >= 0.95f);
+  return mn <= -0.95f && mx >= 0.95f ? 1.0f : 1.0f / wide;
 }
 
 static void ApplyProjection(GLint uProj) {
@@ -610,10 +613,10 @@ static void ApplyProjection(GLint uProj) {
   // Widescreen: the EFB is 4/3 wider, so compress clip-space x by 3/4. For
   // 3D this widens the field of view; for 2D it keeps HUD elements at their
   // 4:3 shape, centred. (Which draws get it: see WidescreenWanted.)
-  if (s_ws_compress && g_state.projSet) {
-    p[0] *= 0.75f;
-    p[8] *= 0.75f;
-    p[12] *= 0.75f;
+  if (s_ws_compress != 1.0f && g_state.projSet) {
+    p[0] *= s_ws_compress;
+    p[8] *= s_ws_compress;
+    p[12] *= s_ws_compress;
   }
   s_ws_applied = s_ws_compress;
   static const bool s_vtxtrace_p = std::getenv("NWII_VTXTRACE") != nullptr;
@@ -1129,7 +1132,7 @@ static void DrawPrimitive(const GXCommand &cmd) {
     printf("\n");
   }
 
-  const bool ws = WidescreenWanted(cmd);
+  const float ws = WidescreenWanted(cmd);
   if (s_batch_open && ws != s_ws_applied) {
     FlushBatch();
     s_batch_open = false; // re-run setup so the projection is rebuilt

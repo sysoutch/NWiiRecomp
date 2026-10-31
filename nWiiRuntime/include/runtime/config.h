@@ -67,7 +67,11 @@ public:
     int internal_scale = 1; // EFB render scale (1 = native 640x480)
     int msaa = 1;           // multisample count for the EFB (1 = off)
     int anisotropy = 1;     // max anisotropic filtering for linear-filtered textures
-    bool widescreen = false; // 16:9 output with a widened 3D field of view
+    bool widescreen = false; // output wider than 4:3 (aspect_w:aspect_h), wider 3D field of view
+    int aspect_w = 4, aspect_h = 3; // [graphics] aspect_ratio, e.g. "16:9"
+    // Output width relative to 4:3: 1 = 4:3, 4/3 = 16:9.
+    float aspect_factor() const { return ((float)aspect_w / aspect_h) / (4.0f / 3.0f); }
+    void set_aspect(int w, int h) { aspect_w = w; aspect_h = h; widescreen = w * 3 != h * 4; }
     bool fullscreen = false; // borderless fullscreen on the current display
     bool show_fps = false;   // small game-FPS counter in the corner
     int frame_rate = 60;     // VI retrace rate = max game fps (60, 90 or 120)

@@ -59,6 +59,7 @@ extern uint64_t g_stat_frames; // gx.cpp
 namespace nwii::runtime::efb {
 int scale = 1, samples = 1, width = 640, height = 480;
 bool widescreen = false;
+float wide = 1.0f;
 float sx = 1.0f, sy = 1.0f;
 unsigned draw_fbo = 0, resolve_fbo = 0, display_fbo = 0;
 int xfb_x = 0, xfb_y = 0, xfb_w = 640, xfb_h = 480;
@@ -198,9 +199,10 @@ void create() {
   const auto &cfg = nwii::runtime::Config::get();
   scale = cfg.internal_scale;
   widescreen = cfg.widescreen;
-  // Widescreen widens the target by 4/3 (4:3 -> 16:9); the renderer widens
+  wide = cfg.aspect_factor();
+  // A wider aspect ratio widens the target (16:9: by 4/3); the renderer widens
   // the 3D field of view to match instead of stretching.
-  width = widescreen ? (640 * scale * 4 + 2) / 3 : 640 * scale;
+  width = (int)std::lround(640 * scale * wide);
   height = 480 * scale;
   sx = width / 640.0f;
   sy = height / 480.0f;
@@ -1140,7 +1142,8 @@ int main(int argc, char **argv) {
           // The game's own anamorphic widescreen also gets the 16:9 stretch.
           extern bool g_game_anamorphic_display();
           const float aspect = (float)efb::xfb_w / (float)efb::xfb_h *
-                               (efb::widescreen || g_game_anamorphic_display() ? 4.0f / 3.0f : 1.0f);
+                               (efb::widescreen ? efb::wide
+                                : g_game_anamorphic_display() ? 4.0f / 3.0f : 1.0f);
           int dw = draw_w, dh = (int)(draw_w / aspect + 0.5f);
           if (dh > draw_h) { dh = draw_h; dw = (int)(draw_h * aspect + 0.5f); }
           const int dx = (draw_w - dw) / 2, dy = (draw_h - dh) / 2;

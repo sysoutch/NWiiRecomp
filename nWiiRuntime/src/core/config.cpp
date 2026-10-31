@@ -2,6 +2,7 @@
 #include "input/key_bindings.h"
 #include <toml++/toml.hpp>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <filesystem>
@@ -62,8 +63,14 @@ void Config::load(const std::string& filepath) {
             msaa = std::clamp(*v, 1, 16);
         if (auto v = tbl["graphics"]["anisotropy"].value<int>())
             anisotropy = std::clamp(*v, 1, 16);
+        // aspect_ratio = "16:9"; older configs have widescreen = true/false.
         if (auto v = tbl["graphics"]["widescreen"].value<bool>())
-            widescreen = *v;
+            set_aspect(*v ? 16 : 4, *v ? 9 : 3);
+        if (auto v = tbl["graphics"]["aspect_ratio"].value<std::string>()) {
+            int w = 0, h = 0;
+            if (std::sscanf(v->c_str(), "%d:%d", &w, &h) == 2 && w > 0 && h > 0 && w * 3 >= h * 4)
+                set_aspect(w, h);
+        }
         if (auto v = tbl["graphics"]["fullscreen"].value<bool>())
             fullscreen = *v;
         if (auto v = tbl["graphics"]["show_fps"].value<bool>())
@@ -105,8 +112,8 @@ void Config::load(const std::string& filepath) {
                               << ": unknown control or input name" << std::endl;
         }
         std::cout << "[Config] internal_scale " << internal_scale << "x, msaa "
-                  << msaa << "x, anisotropy " << anisotropy << "x, widescreen "
-                  << (widescreen ? "on" : "off") << std::endl;
+                  << msaa << "x, anisotropy " << anisotropy << "x, aspect "
+                  << aspect_w << ":" << aspect_h << std::endl;
 
         auto gid = tbl["game"]["id"].value<std::string>();
         if (gid) {
