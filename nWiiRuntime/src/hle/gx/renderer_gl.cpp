@@ -537,7 +537,17 @@ static bool WidescreenWanted(const GXCommand &cmd) {
     // perspective x scale is already 3/4 of the 4:3 one (y/x ratio ~1.72
     // instead of ~1.29). Compressing again gave a doubly widened view.
     const float sx = g_state.projection[0], sy = g_state.projection[2];
-    if (sx > 0.0f && sy / sx > 1.5f) return false;
+    if (sx > 0.0f && sy / sx > 1.5f) {
+      // The dialog camera is that wide too, and the dialog panel is flat 3D
+      // UI under the same projection (z = -220, screen-locked): it belongs
+      // with the 2D text, which is compressed, or the two do not line up.
+      float zmin = 1e9f, zmax = -1e9f;
+      for (const auto &v : cmd.vertices) {
+        zmin = std::min(zmin, v.pos[2]);
+        zmax = std::max(zmax, v.pos[2]);
+      }
+      return zmax - zmin < 0.01f && zmin > -300.0f && zmax < 0.0f;
+    }
     return true;
   }
   const float a = g_state.projection[0], b = g_state.projection[1];
