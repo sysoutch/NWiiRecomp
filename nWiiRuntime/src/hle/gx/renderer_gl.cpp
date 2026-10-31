@@ -532,26 +532,26 @@ static float WidescreenWanted(const GXCommand &cmd) {
   float left, top, w, h;
   GetViewport(left, top, w, h);
   if (w < 600.0f)
-    return false;
+    return 1.0f;
   if (g_state.projType == 0) {
     // The game's own "Widescreen 16:9" option renders anamorphically: its
-    // perspective x scale is already 3/4 of the 4:3 one (y/x ratio ~1.72
-    // instead of ~1.29). Compressing again gave a doubly widened view.
-    const float sx = g_state.projection[0], sy = g_state.projection[2];
-    if (sx > 0.0f && sy / sx > 1.5f) {
-      // The dialog camera is that wide too, and the dialog panel is flat 3D
-      // UI under the same projection (z = -220, screen-locked): it belongs
-      // with the 2D text, which is compressed, or the two do not line up.
-      float zmin = 1e9f, zmax = -1e9f;
-      for (const auto &v : cmd.vertices) {
-        zmin = std::min(zmin, v.pos[2]);
-        zmax = std::max(zmax, v.pos[2]);
-      }
-      if (zmax - zmin < 0.01f && zmin > -300.0f && zmax < 0.0f) return 1.0f / wide;
-      // The scene: already 16:9 wide, so only what lies beyond 16:9.
-      return (4.0f / 3.0f) / wide;
+    // perspective x scale is 0.663 of the 4:3 one (y/x ratio ~1.95 instead of
+    // ~1.29). Compressing again gave a doubly widened view.
+    // Menu and dialog panels are flat 3D UI (all at z = -220, screen-locked):
+    // they belong with the 2D text, which is compressed, or the two do not
+    // line up.
+    float zmin = 1e9f, zmax = -1e9f;
+    for (const auto &v : cmd.vertices) {
+      zmin = std::min(zmin, v.pos[2]);
+      zmax = std::max(zmax, v.pos[2]);
     }
-    return 1.0f / wide;
+    if (zmax - zmin < 0.01f && zmin > -300.0f && zmax < 0.0f) return 1.0f / wide;
+    // The scene, with the game's option on: already 16:9 wide, so only what
+    // lies beyond 16:9.
+    const float sx = g_state.projection[0], sy = g_state.projection[2];
+    if (sx > 0.0f && sy / sx > 1.5f) return (4.0f / 3.0f) / wide;
+    // Option off: the same picture, its 0.663 at 16:9 rather than a flat 3/4.
+    return nwii::runtime::efb::kSceneWiden / wide;
   }
   const float a = g_state.projection[0], b = g_state.projection[1];
   float mn = 1e9f, mx = -1e9f;
@@ -1572,11 +1572,30 @@ static void EmitPrimitive(const GXCommand &cmd) {
 // are up to 1920x1440) although the game almost always samples them unmipped.
 static std::unordered_set<GLuint> s_efb_mips_stale;
 
+// Widescreen: a camera-facing quad whose texture coordinates run a little past
+// the texture (the logo and copyright screens, -0.24..1.24 on a repeating
+// texture) showed the repeats in the extra width, just off-screen at 4:3. Such
+// a quad gets a clamped s coordinate; tiling surfaces are not camera-facing.
+static bool s_clamp_s = false;
+static bool WantClampS(const GXCommand &cmd) {
+  if (!nwii::runtime::efb::widescreen || !g_state.projSet || g_state.projType != 0 ||
+      cmd.vertices.size() != 4)
+    return false;
+  float zmin = 1e9f, zmax = -1e9f, umin = 1e9f, umax = -1e9f;
+  for (const auto &v : cmd.vertices) {
+    zmin = std::min(zmin, v.pos[2]);
+    zmax = std::max(zmax, v.pos[2]);
+    umin = std::min(umin, v.tex[0][0]);
+    umax = std::max(umax, v.tex[0][0]);
+  }
+  return zmax - zmin < 0.01f && (umin < 0.0f || umax > 1.0f) && umin > -1.0f && umax < 2.0f;
+}
+
 static void ApplySamplerMode(int map) {
   const uint32_t m0 = g_state.bp[(map < 4 ? 0x80 : 0xA0) + (map & 3)];
   static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT,
                                 GL_REPEAT};
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[m0 & 3]);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, s_clamp_s ? GL_CLAMP_TO_EDGE : wrap[m0 & 3]);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[(m0 >> 2) & 3]);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
                   (m0 & 0x10) ? GL_LINEAR : GL_NEAREST);
@@ -2291,6 +2310,14 @@ public:
       } else if (cmd.type == GXCommandType::DrawPrimitive) {
         ++s_draws_since_clear;
         if (s_proj_persp) ++(s_proj_anamorphic ? s_ana_draws : s_std_draws);
+        const bool clamp_s = WantClampS(cmd);
+        if (clamp_s != s_clamp_s) {
+          if (s_batch_open) {
+            FlushBatch();
+            s_batch_open = false;
+          }
+          s_clamp_s = clamp_s;
+        }
         if (!s_batch_open && g_ctx_ptr) {
           for (int i = 0; i < 8; ++i) {
             const auto &stage = g_state.texStages[i];

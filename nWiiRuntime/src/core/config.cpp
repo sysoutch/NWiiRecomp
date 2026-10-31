@@ -63,12 +63,14 @@ void Config::load(const std::string& filepath) {
             msaa = std::clamp(*v, 1, 16);
         if (auto v = tbl["graphics"]["anisotropy"].value<int>())
             anisotropy = std::clamp(*v, 1, 16);
-        // aspect_ratio = "16:9"; older configs have widescreen = true/false.
-        if (auto v = tbl["graphics"]["widescreen"].value<bool>())
-            set_aspect(*v ? 16 : 4, *v ? 9 : 3);
+        // aspect_ratio = "game": the game's own Widescreen option decides
+        // (4:3, or its anamorphic 16:9 stretched by the presenter); "16:10",
+        // "21:9", "32:9": wider than that. 4:3 and 16:9 (also from older
+        // configs) mean "game".
         if (auto v = tbl["graphics"]["aspect_ratio"].value<std::string>()) {
             int w = 0, h = 0;
-            if (std::sscanf(v->c_str(), "%d:%d", &w, &h) == 2 && w > 0 && h > 0 && w * 3 >= h * 4)
+            if (std::sscanf(v->c_str(), "%d:%d", &w, &h) == 2 && w > 0 && h > 0 &&
+                w * 3 > h * 4 && w * 9 != h * 16)
                 set_aspect(w, h);
         }
         if (auto v = tbl["graphics"]["fullscreen"].value<bool>())
@@ -89,6 +91,15 @@ void Config::load(const std::string& filepath) {
             mouse_invert_y = *v;
         if (auto v = tbl["launcher"]["enabled"].value<bool>())
             launcher = *v;
+        const auto native_path = [](const std::string &u8) -> std::string {
+            try {
+                return std::filesystem::path(std::u8string(u8.begin(), u8.end())).string();
+            } catch (const std::exception &) { return {}; } // not representable here
+        };
+        if (auto v = tbl["launcher"]["memcard"].value<std::string>())
+            memcard_path = native_path(*v);
+        if (auto v = tbl["launcher"]["bios"].value<std::string>())
+            bios_path = native_path(*v);
         if (auto *arr = tbl["launcher"]["recent"].as_array())
             for (auto &&el : *arr)
                 if (auto path = el.value<std::string>()) {

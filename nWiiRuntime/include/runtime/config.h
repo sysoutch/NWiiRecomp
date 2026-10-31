@@ -82,6 +82,8 @@ public:
     bool mouse_invert_y = false; // [mouse] invert_y (look mode, Y held)
     bool launcher = true;    // [launcher] enabled: title menu before the game boots
     std::vector<std::string> recent_discs; // [launcher] recent, newest first
+    std::string memcard_path; // [launcher] memcard; empty = memcard_A.raw next to the game
+    std::string bios_path;    // [launcher] bios (boot ROM, for its fonts); empty = the font files
     std::string config_path; // the TOML loaded; the settings overlay saves here
     std::string game_dir;
 

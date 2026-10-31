@@ -2,6 +2,7 @@
 #include "runtime/config.h"
 #include "runtime/disc_image.h"
 #include "runtime/efb.h"
+#include "runtime/hw/hw.h"
 #include "runtime/settings_overlay.h"
 #include "ui_theme.h"
 
@@ -95,7 +96,8 @@ namespace {
 
 using namespace ui::theme;
 
-enum class Screen { Main, Recent, Credits };
+enum class Screen { Main, Recent, Files, Credits };
+enum Pick { kPickNone, kPickDisc, kPickCard, kPickBios };
 
 struct State {
     SDL_Window *window = nullptr;
@@ -105,7 +107,7 @@ struct State {
     std::string message; // last error, shown in the footer
     std::string hint;    // footer text for the highlighted entry (this frame)
     Screen screen = Screen::Main;
-    int pick = 0; // 1: open the file dialog after this frame
+    int pick = kPickNone; // file dialog to open after this frame
     bool done = false, quit = false;
     // Selection, driven by keys / gamepad / mouse (not ImGui's nav, so one
     // button is always highlighted, like a console menu).
@@ -156,9 +158,8 @@ void choose(const std::string &path) {
 }
 
 #ifdef _WIN32
-// Windows file dialog. An extracted disc can be opened through its
-// sys/boot.bin or sys/main.dol.
-std::string pick_disc() {
+// Windows file dialog.
+std::string pick_file(const wchar_t *title, const COMDLG_FILTERSPEC *types, UINT count) {
     std::string result;
     HWND owner = nullptr;
     SDL_SysWMinfo wm;
@@ -167,30 +168,18 @@ std::string pick_disc() {
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     IFileOpenDialog *dlg = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dlg)))) {
-        const COMDLG_FILTERSPEC types[] = {
-            {L"GameCube disc (*.iso, *.gcm, *.rvz, extracted boot.bin / main.dol)",
-             L"*.iso;*.gcm;*.rvz;boot.bin;main.dol"},
-            {L"Other disc formats (*.wia, *.gcz, *.ciso) - convert first", L"*.wia;*.gcz;*.ciso"},
-            {L"All files", L"*.*"},
-        };
-        dlg->SetFileTypes(3, types);
-        dlg->SetTitle(L"Open Spyro: Enter the Dragonfly disc");
+        dlg->SetFileTypes(count, types);
+        dlg->SetTitle(title);
         if (SUCCEEDED(dlg->Show(owner))) {
             IShellItem *item = nullptr;
             if (SUCCEEDED(dlg->GetResult(&item))) {
                 PWSTR wpath = nullptr;
                 if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &wpath))) {
                     try {
-                        fs::path p(wpath);
-                        const auto name = p.filename().wstring();
-                        if (name == L"boot.bin" || name == L"main.dol") {
-                            p = p.parent_path();
-                            if (p.filename() == L"sys") p = p.parent_path();
-                        }
-                        result = p.string();
+                        result = fs::path(wpath).string();
                     } catch (const std::exception &) {
                         S.message = "That path has characters this build can't open; "
-                                    "move the disc to a folder with a plain name.";
+                                    "move the file to a folder with a plain name.";
                     }
                     CoTaskMemFree(wpath);
                 }
@@ -202,12 +191,66 @@ std::string pick_disc() {
     if (SUCCEEDED(co)) CoUninitialize();
     return result;
 }
+
+// An extracted disc can be opened through its sys/boot.bin or sys/main.dol.
+std::string pick_disc() {
+    const COMDLG_FILTERSPEC types[] = {
+        {L"GameCube disc (*.iso, *.gcm, *.rvz, extracted boot.bin / main.dol)",
+         L"*.iso;*.gcm;*.rvz;boot.bin;main.dol"},
+        {L"Other disc formats (*.wia, *.gcz, *.ciso) - convert first", L"*.wia;*.gcz;*.ciso"},
+        {L"All files", L"*.*"},
+    };
+    const std::string path = pick_file(L"Open Spyro: Enter the Dragonfly disc", types, 3);
+    if (path.empty()) return {};
+    fs::path p(path);
+    const auto name = p.filename().wstring();
+    if (name == L"boot.bin" || name == L"main.dol") {
+        p = p.parent_path();
+        if (p.filename() == L"sys") p = p.parent_path();
+    }
+    return p.string();
+}
+
+std::string pick_card() {
+    const COMDLG_FILTERSPEC types[] = {{L"GameCube memory card (*.raw)", L"*.raw"}, {L"All files", L"*.*"}};
+    return pick_file(L"Choose a memory card", types, 2);
+}
+
+std::string pick_bios() {
+    const COMDLG_FILTERSPEC types[] = {{L"GameCube BIOS (*.bin)", L"*.bin"}, {L"All files", L"*.*"}};
+    return pick_file(L"Choose a GameCube BIOS (ipl.bin)", types, 2);
+}
 #else
 std::string pick_disc() {
     S.message = "Pass the disc path on the command line.";
     return {};
 }
+std::string pick_card() {
+    S.message = "Set [launcher] memcard in spyro.toml.";
+    return {};
+}
+std::string pick_bios() {
+    S.message = "Set [launcher] bios in spyro.toml.";
+    return {};
+}
 #endif
+
+// Use a card or BIOS the file dialog returned, if it is one.
+void choose_file(std::string &setting, const std::string &path, const std::string &error) {
+    if (!error.empty()) {
+        S.message = error;
+        return;
+    }
+    setting = path;
+    ui::save_settings();
+}
+
+// "Memory Card: name" / "BIOS: name" button text; "Default" when none is set.
+std::string file_label(const char *what, const std::string &path) {
+    std::error_code ec;
+    return std::string(what) + ": " +
+           (path.empty() ? "Default" : file_name(path) + (fs::exists(path, ec) ? "" : "  (missing)"));
+}
 
 // --- Background: a sunset over hills, drawn procedurally --------------------
 void draw_pagoda(ImDrawList *dl, float x, float base, float s, ImU32 col) {
@@ -504,8 +547,9 @@ void draw() {
     const bool ready = playable(S.info);
     int rows = 0;
     switch (S.screen) {
-    case Screen::Main: rows = 6 + (ready ? 1 : 0); break;
+    case Screen::Main: rows = 7 + (ready ? 1 : 0); break;
     case Screen::Recent: rows = std::max<int>(1, (int)Config::get().recent_discs.size()) + 1; break;
+    case Screen::Files: rows = 5; break;
     case Screen::Credits: rows = 1; break;
     }
     const float row_h = fs * 1.95f + ImGui::GetStyle().ItemSpacing.y;
@@ -514,13 +558,21 @@ void draw() {
     S.hint.clear();
     if (S.screen == Screen::Recent && S.sel < (int)Config::get().recent_discs.size())
         S.hint = Config::get().recent_discs[S.sel];
+    if (S.screen == Screen::Files) {
+        const Config &cfg = Config::get();
+        if (S.sel <= 1)
+            S.hint = !cfg.memcard_path.empty() ? cfg.memcard_path : "memcard_A.raw next to the game";
+        else if (S.sel <= 3)
+            S.hint = "The game runs without a BIOS: only its fonts are used. Default: the font files "
+                     "next to the game.";
+    }
     ImU32 status_col;
     const std::string status = footer_status(status_col);
     const float wrap = pw - fs * 4.4f;
     const float top_room = fs * 2.6f, footer_h = footer_height(wrap_lines(status, wrap, fs).size(), fs);
     // Same panel size on every screen (the main menu's), taller only for a
     // long recent list.
-    const float body = std::max(rows, 7) * row_h;
+    const float body = std::max(rows, 8) * row_h;
     const float plaque_h = fs * 7.2f;
     const float ph = std::min(top_room + body + footer_h + fs * 2.2f, vp->Size.y - plaque_h * 0.75f - fs);
     const float total = plaque_h * 0.75f + ph;
@@ -549,9 +601,13 @@ void draw() {
             remember(S.disc);
             S.done = true;
         }
-        if (menu_button("Open Spyro ISO", bw)) S.pick = 1;
+        if (menu_button("Open Spyro ISO", bw)) S.pick = kPickDisc;
         if (menu_button("Recent ISOs", bw, !Config::get().recent_discs.empty())) {
             S.screen = Screen::Recent;
+            S.message.clear();
+        }
+        if (menu_button("Memory Card & BIOS", bw)) {
+            S.screen = Screen::Files;
             S.message.clear();
         }
         if (menu_button("Settings", bw)) ui::open_settings(0);
@@ -569,6 +625,28 @@ void draw() {
             if (menu_button(label.c_str(), pw * 0.86f, there)) choose(recent[i]);
         }
         if (menu_button("Back", bw)) S.screen = Screen::Main;
+        break;
+    }
+    case Screen::Files: {
+        Config &cfg = Config::get();
+        const std::string card = file_label("Memory Card", cfg.memcard_path) + "##card";
+        const std::string bios = file_label("BIOS", cfg.bios_path) + "##bios";
+        if (menu_button(card.c_str(), pw * 0.86f)) S.pick = kPickCard;
+        if (menu_button("Use Default Memory Card", pw * 0.86f, !cfg.memcard_path.empty())) {
+            cfg.memcard_path.clear();
+            ui::save_settings();
+            S.message.clear();
+        }
+        if (menu_button(bios.c_str(), pw * 0.86f)) S.pick = kPickBios;
+        if (menu_button("Use Default BIOS", pw * 0.86f, !cfg.bios_path.empty())) {
+            cfg.bios_path.clear();
+            ui::save_settings();
+            S.message.clear();
+        }
+        if (menu_button("Back", bw)) {
+            S.screen = Screen::Main;
+            S.message.clear();
+        }
         break;
     }
     case Screen::Credits: {
@@ -691,10 +769,14 @@ std::string run(SDL_Window *window, const std::string &disc) {
         if (req.quit) S.quit = S.done = true;
 
         if (S.pick) {
-            S.pick = 0;
+            const int pick = S.pick;
+            S.pick = kPickNone;
             S.message.clear();
-            const std::string path = pick_disc();
-            if (!path.empty()) choose(path);
+            Config &cfg = Config::get();
+            const std::string path = pick == kPickDisc ? pick_disc() : pick == kPickCard ? pick_card() : pick_bios();
+            if (!path.empty() && pick == kPickDisc) choose(path);
+            if (!path.empty() && pick == kPickCard) choose_file(cfg.memcard_path, path, hw::memcard_file_error(path));
+            if (!path.empty() && pick == kPickBios) choose_file(cfg.bios_path, path, hw::bios_file_error(path));
         }
         // ~60 fps is plenty for a menu (and keeps the GPU idle).
         std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(16));

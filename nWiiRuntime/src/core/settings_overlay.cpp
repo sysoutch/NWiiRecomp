@@ -321,8 +321,8 @@ void graphics_tab() {
     ImGui::Spacing();
     {
         // w * 100 + h as the combo value.
-        const std::vector<int> v = {403, 1610, 1609, 2109, 3209};
-        const std::vector<std::string> l = {"4:3  (original)", "16:10", "16:9", "21:9", "32:9"};
+        const std::vector<int> v = {403, 1610, 2109, 3209};
+        const std::vector<std::string> l = {"Game Aspect Ratio", "16:10", "21:9", "32:9"};
         int code = cfg.aspect_w * 100 + cfg.aspect_h;
         row_label("Aspect ratio");
         if (int_combo("##aspect", code, v, l)) {
@@ -330,7 +330,8 @@ void graphics_tab() {
             s_req.rebuild_efb = true;
             changed();
         }
-        help("Wider field of view instead of stretching; the HUD keeps its shape.");
+        help("In-game: the game's own Widescreen option decides (4:3 or 16:9). The others "
+             "widen the field of view; the HUD keeps its shape.");
     }
     row_label("Fullscreen");
     if (ImGui::Checkbox("##fs", &cfg.fullscreen)) {
@@ -794,9 +795,10 @@ bool save_settings() {
     set_value(lines, "graphics", "internal_scale", std::to_string(cfg.internal_scale));
     set_value(lines, "graphics", "msaa", std::to_string(cfg.msaa));
     set_value(lines, "graphics", "anisotropy", std::to_string(cfg.anisotropy));
-    set_value(lines, "graphics", "widescreen", b2s(cfg.widescreen));
     set_value(lines, "graphics", "aspect_ratio",
-              "\"" + std::to_string(cfg.aspect_w) + ":" + std::to_string(cfg.aspect_h) + "\"");
+              cfg.widescreen ? "\"" + std::to_string(cfg.aspect_w) + ":" +
+                                   std::to_string(cfg.aspect_h) + "\""
+                             : std::string("\"game\""));
     set_value(lines, "graphics", "fullscreen", b2s(cfg.fullscreen));
     set_value(lines, "graphics", "vsync", b2s(cfg.enable_vsync));
     set_value(lines, "graphics", "show_fps", b2s(cfg.show_fps));
@@ -807,6 +809,12 @@ bool save_settings() {
     set_value(lines, "mouse", "sensitivity", std::to_string(cfg.mouse_sensitivity));
     set_value(lines, "mouse", "invert_y", b2s(cfg.mouse_invert_y));
     set_value(lines, "launcher", "enabled", b2s(cfg.launcher));
+    const auto path_value = [](const std::string &p) {
+        const std::u8string u8 = std::filesystem::path(p).u8string();
+        return toml_string(std::string(u8.begin(), u8.end()));
+    };
+    set_value(lines, "launcher", "memcard", path_value(cfg.memcard_path));
+    set_value(lines, "launcher", "bios", path_value(cfg.bios_path));
     {
         std::string arr = "[";
         for (size_t i = 0; i < cfg.recent_discs.size(); ++i)

@@ -12,6 +12,9 @@ extern int scale;            // internal resolution multiplier ([graphics] inter
 extern int samples;          // MSAA samples, 1 = off ([graphics] msaa)
 extern bool widescreen;      // EFB wider than 4:3 ([graphics] aspect_ratio)
 extern float wide;           // its width relative to 4:3 (1 = 4:3, 4/3 = 16:9)
+// 3D x scale on top of 1/wide: the game's own widescreen option scales x by
+// 0.6633 (Spyro: 1.42815 -> 0.947307) where 16:9 alone would be 3/4.
+constexpr float kSceneWiden = 0.8844f;
 extern int width, height;    // host size
 extern float sx, sy;         // host pixels per native EFB unit
 extern unsigned draw_fbo;    // what GX draws into (multisampled when samples > 1)
