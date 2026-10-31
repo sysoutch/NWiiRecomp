@@ -98,8 +98,6 @@ void Config::load(const std::string& filepath) {
         };
         if (auto v = tbl["launcher"]["memcard"].value<std::string>())
             memcard_path = native_path(*v);
-        if (auto v = tbl["launcher"]["bios"].value<std::string>())
-            bios_path = native_path(*v);
         if (auto *arr = tbl["launcher"]["recent"].as_array())
             for (auto &&el : *arr)
                 if (auto path = el.value<std::string>()) {

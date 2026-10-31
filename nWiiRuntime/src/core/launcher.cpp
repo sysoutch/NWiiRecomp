@@ -96,8 +96,8 @@ namespace {
 
 using namespace ui::theme;
 
-enum class Screen { Main, Recent, Files, Credits };
-enum Pick { kPickNone, kPickDisc, kPickCard, kPickBios };
+enum class Screen { Main, Recent, Card, Credits };
+enum Pick { kPickNone, kPickDisc, kPickCard };
 
 struct State {
     SDL_Window *window = nullptr;
@@ -165,6 +165,12 @@ std::string pick_file(const wchar_t *title, const COMDLG_FILTERSPEC *types, UINT
     SDL_SysWMinfo wm;
     SDL_VERSION(&wm.version);
     if (SDL_GetWindowWMInfo(S.window, &wm)) owner = wm.info.win.window;
+    // A fullscreen GL window covers the dialog: windowed while it is open.
+    const bool fullscreen = SDL_GetWindowFlags(S.window) & SDL_WINDOW_FULLSCREEN;
+    if (fullscreen) {
+        SDL_SetWindowFullscreen(S.window, 0);
+        SDL_PumpEvents();
+    }
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     IFileOpenDialog *dlg = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dlg)))) {
@@ -189,6 +195,7 @@ std::string pick_file(const wchar_t *title, const COMDLG_FILTERSPEC *types, UINT
         dlg->Release();
     }
     if (SUCCEEDED(co)) CoUninitialize();
+    if (fullscreen) SDL_SetWindowFullscreen(S.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
     return result;
 }
 
@@ -216,10 +223,6 @@ std::string pick_card() {
     return pick_file(L"Choose a memory card", types, 2);
 }
 
-std::string pick_bios() {
-    const COMDLG_FILTERSPEC types[] = {{L"GameCube BIOS (*.bin)", L"*.bin"}, {L"All files", L"*.*"}};
-    return pick_file(L"Choose a GameCube BIOS (ipl.bin)", types, 2);
-}
 #else
 std::string pick_disc() {
     S.message = "Pass the disc path on the command line.";
@@ -229,26 +232,19 @@ std::string pick_card() {
     S.message = "Set [launcher] memcard in spyro.toml.";
     return {};
 }
-std::string pick_bios() {
-    S.message = "Set [launcher] bios in spyro.toml.";
-    return {};
-}
 #endif
 
-// Use a card or BIOS the file dialog returned, if it is one.
-void choose_file(std::string &setting, const std::string &path, const std::string &error) {
-    if (!error.empty()) {
-        S.message = error;
-        return;
-    }
-    setting = path;
+// Use the card the file dialog returned, if it is one.
+void choose_card(const std::string &path) {
+    S.message = hw::memcard_file_error(path);
+    if (!S.message.empty()) return;
+    Config::get().memcard_path = path;
     ui::save_settings();
 }
 
-// "Memory Card: name" / "BIOS: name" button text; "Default" when none is set.
-std::string file_label(const char *what, const std::string &path) {
+std::string card_label(const std::string &path) {
     std::error_code ec;
-    return std::string(what) + ": " +
+    return "Memory Card: " +
            (path.empty() ? "Default" : file_name(path) + (fs::exists(path, ec) ? "" : "  (missing)"));
 }
 
@@ -549,7 +545,7 @@ void draw() {
     switch (S.screen) {
     case Screen::Main: rows = 7 + (ready ? 1 : 0); break;
     case Screen::Recent: rows = std::max<int>(1, (int)Config::get().recent_discs.size()) + 1; break;
-    case Screen::Files: rows = 5; break;
+    case Screen::Card: rows = 3; break;
     case Screen::Credits: rows = 1; break;
     }
     const float row_h = fs * 1.95f + ImGui::GetStyle().ItemSpacing.y;
@@ -558,13 +554,9 @@ void draw() {
     S.hint.clear();
     if (S.screen == Screen::Recent && S.sel < (int)Config::get().recent_discs.size())
         S.hint = Config::get().recent_discs[S.sel];
-    if (S.screen == Screen::Files) {
-        const Config &cfg = Config::get();
-        if (S.sel <= 1)
-            S.hint = !cfg.memcard_path.empty() ? cfg.memcard_path : "memcard_A.raw next to the game";
-        else if (S.sel <= 3)
-            S.hint = "The game runs without a BIOS: only its fonts are used. Default: the font files "
-                     "next to the game.";
+    if (S.screen == Screen::Card && S.sel <= 1) {
+        const std::string &card = Config::get().memcard_path;
+        S.hint = !card.empty() ? card : "memcard_A.raw next to the game";
     }
     ImU32 status_col;
     const std::string status = footer_status(status_col);
@@ -606,8 +598,8 @@ void draw() {
             S.screen = Screen::Recent;
             S.message.clear();
         }
-        if (menu_button("Memory Card & BIOS", bw)) {
-            S.screen = Screen::Files;
+        if (menu_button("Memory Card", bw)) {
+            S.screen = Screen::Card;
             S.message.clear();
         }
         if (menu_button("Settings", bw)) ui::open_settings(0);
@@ -627,19 +619,12 @@ void draw() {
         if (menu_button("Back", bw)) S.screen = Screen::Main;
         break;
     }
-    case Screen::Files: {
+    case Screen::Card: {
         Config &cfg = Config::get();
-        const std::string card = file_label("Memory Card", cfg.memcard_path) + "##card";
-        const std::string bios = file_label("BIOS", cfg.bios_path) + "##bios";
+        const std::string card = card_label(cfg.memcard_path) + "##card";
         if (menu_button(card.c_str(), pw * 0.86f)) S.pick = kPickCard;
         if (menu_button("Use Default Memory Card", pw * 0.86f, !cfg.memcard_path.empty())) {
             cfg.memcard_path.clear();
-            ui::save_settings();
-            S.message.clear();
-        }
-        if (menu_button(bios.c_str(), pw * 0.86f)) S.pick = kPickBios;
-        if (menu_button("Use Default BIOS", pw * 0.86f, !cfg.bios_path.empty())) {
-            cfg.bios_path.clear();
             ui::save_settings();
             S.message.clear();
         }
@@ -772,11 +757,9 @@ std::string run(SDL_Window *window, const std::string &disc) {
             const int pick = S.pick;
             S.pick = kPickNone;
             S.message.clear();
-            Config &cfg = Config::get();
-            const std::string path = pick == kPickDisc ? pick_disc() : pick == kPickCard ? pick_card() : pick_bios();
+            const std::string path = pick == kPickDisc ? pick_disc() : pick_card();
             if (!path.empty() && pick == kPickDisc) choose(path);
-            if (!path.empty() && pick == kPickCard) choose_file(cfg.memcard_path, path, hw::memcard_file_error(path));
-            if (!path.empty() && pick == kPickBios) choose_file(cfg.bios_path, path, hw::bios_file_error(path));
+            if (!path.empty() && pick == kPickCard) choose_card(path);
         }
         // ~60 fps is plenty for a menu (and keeps the GPU idle).
         std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(16));

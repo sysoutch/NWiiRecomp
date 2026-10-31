@@ -53,9 +53,8 @@ void register_dsp(MMIODispatcher &dispatcher);
 void register_ai(MMIODispatcher &dispatcher);
 void register_di(MMIODispatcher &dispatcher);
 void register_exi(MMIODispatcher &dispatcher);
-// Why a file can't be the memory card / boot ROM; empty when it can.
+// Why a file can't be the memory card; empty when it can.
 std::string memcard_file_error(const std::string &path);
-std::string bios_file_error(const std::string &path);
 void register_ipc(MMIODispatcher &dispatcher);
 
 void register_all_hw(MMIODispatcher &dispatcher);

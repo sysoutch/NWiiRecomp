@@ -809,12 +809,10 @@ bool save_settings() {
     set_value(lines, "mouse", "sensitivity", std::to_string(cfg.mouse_sensitivity));
     set_value(lines, "mouse", "invert_y", b2s(cfg.mouse_invert_y));
     set_value(lines, "launcher", "enabled", b2s(cfg.launcher));
-    const auto path_value = [](const std::string &p) {
-        const std::u8string u8 = std::filesystem::path(p).u8string();
-        return toml_string(std::string(u8.begin(), u8.end()));
-    };
-    set_value(lines, "launcher", "memcard", path_value(cfg.memcard_path));
-    set_value(lines, "launcher", "bios", path_value(cfg.bios_path));
+    {
+        const std::u8string u8 = std::filesystem::path(cfg.memcard_path).u8string();
+        set_value(lines, "launcher", "memcard", toml_string(std::string(u8.begin(), u8.end())));
+    }
     {
         std::string arr = "[";
         for (size_t i = 0; i < cfg.recent_discs.size(); ++i)

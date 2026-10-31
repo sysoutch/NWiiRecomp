@@ -22,8 +22,7 @@ namespace nwii::runtime::hw {
 //
 //  * channel 0 / device 1 -- the IPL: boot ROM (only the fonts, for
 //    OSInitFont; Spyro panics in bitfont.cpp without them, taken from
-//    [launcher] bios or else Dolphin's Sys/GC replacements next to the game)
-//    and SRAM;
+//    Dolphin's Sys/GC replacements next to the game) and SRAM;
 //  * channel 0 / device 0 -- memory card slot A, a 59-block card backed by
 //    [launcher] memcard or else memcard_A.raw next to the game, so the SDK's
 //    own CARD library can format, save and load.
@@ -56,8 +55,6 @@ static std::filesystem::path find_next_to_game(const char *name) {
     return {};
 }
 
-static constexpr uint32_t IPL_SIZE = 0x200000;
-static constexpr uint32_t IPL_FONT_JP = 0x1AFF00, IPL_FONT_WEST = 0x1FCF00;
 static constexpr uint32_t CARD_SIZE = 4u << 17; // 4 Mbit, 59 usable blocks
 
 std::string memcard_file_error(const std::string &path) {
@@ -65,21 +62,6 @@ std::string memcard_file_error(const std::string &path) {
     const auto n = std::filesystem::file_size(path, ec);
     if (ec) return "That memory card file can't be read.";
     if (n != CARD_SIZE) return "Only 59-block memory cards (512 KB .raw files) work here.";
-    return {};
-}
-
-std::string bios_file_error(const std::string &path) {
-    std::error_code ec;
-    const auto n = std::filesystem::file_size(path, ec);
-    if (ec) return "That BIOS file can't be read.";
-    std::ifstream f(path, std::ios::binary);
-    const auto has_font = [&f](uint32_t off) {
-        char magic[4] = {};
-        f.seekg(off);
-        return f.read(magic, 4) && std::memcmp(magic, "Yay0", 4) == 0;
-    };
-    if (n != IPL_SIZE || !has_font(IPL_FONT_JP) || !has_font(IPL_FONT_WEST))
-        return "That is not a GameCube BIOS (2 MB ipl.bin).";
     return {};
 }
 
@@ -96,7 +78,7 @@ struct ExiDevice {
 
 class IplDevice : public ExiDevice {
 public:
-    static constexpr uint32_t ROM_SIZE = IPL_SIZE;
+    static constexpr uint32_t ROM_SIZE = 0x200000;
 
     IplDevice() {
         // SRAM: zero except the flash-ID checksums. The CARD library checks
@@ -136,19 +118,8 @@ private:
         if (!rom_.empty())
             return;
         rom_.assign(ROM_SIZE, 0);
-        const std::string &bios = Config::get().bios_path;
-        if (!bios.empty()) {
-            const std::string err = bios_file_error(bios);
-            if (err.empty()) {
-                std::ifstream(bios, std::ios::binary)
-                    .read(reinterpret_cast<char *>(rom_.data()), ROM_SIZE);
-                std::cout << "[HW EXI] BIOS: " << bios << "\n";
-                return;
-            }
-            std::cout << "[HW EXI] BIOS " << bios << ": " << err << " Using the font files\n";
-        }
-        load_font("font_japanese.bin", IPL_FONT_JP);
-        load_font("font_western.bin", IPL_FONT_WEST);
+        load_font("font_japanese.bin", 0x1AFF00);
+        load_font("font_western.bin", 0x1FCF00);
     }
     void load_font(const char *name, uint32_t rom_off) {
         const auto p = find_next_to_game(name);
